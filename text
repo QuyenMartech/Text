@@ -101,6 +101,20 @@ def close_block_popup(self):
             return blocked_text in page_source or blocked_text_2 in page_source
         except:
             return False
+			
+    def check_suspicious(self):
+        try:
+            current_url = self.driver.current_url.lower()
+            if "facebook.com/checkpoint/601051028565049" in current_url:
+                skip_button = self.driver.find_elements(By.XPATH, "//span[@class='x1lliihq x6ikm8r x10wlt62 x1n2onr6 xlyipyv xuxw1ft'][contains(text(), 'Bỏ qua') or contains(text(), 'Dismiss')]")
+                if skip_button:
+                    actions = ActionChains(self.driver)
+                    actions.double_click(skip_button[0]).perform()
+                    time.sleep(1)
+                    return True
+            return False
+        except:
+            return False
 
     def scroll_and_collect_groups(self):
         print(f"[Worker {self.worker_id}] Bắt đầu scroll và thu thập URLs...")
@@ -346,6 +360,12 @@ def worker_process(chrome_instance: ChromeInstance, keywords: List[str], process
                 chrome_instance.is_blocked = True
                 print(f"[Worker {chrome_instance.worker_id}] Tài khoản bị chặn tạm thời, dừng worker")
                 break
+				
+			# Thêm kiểm tra suspicious
+            if chrome_instance.check_suspicious():
+                print(f"[Worker {chrome_instance.worker_id}] Đã xử lý cảnh báo suspicious")
+                time.sleep(random.uniform(1, 2))
+                continue
 
             with lock:
                 if len(keywords) < 2:
