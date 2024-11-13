@@ -13,9 +13,11 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, WebDriverException, NoSuchWindowException
 from collections import defaultdict, deque
 from typing import Dict, List
+from selenium.webdriver.common.action_chains import ActionChains
 import os
 import threading
 import math
+
 
 # Configuration parameters
 MIN_DELAY_BETWEEN_REQUESTS = 0.5
@@ -66,6 +68,16 @@ class ChromeInstance:
             return self.driver
         except Exception as e:
             raise Exception(f"Lỗi khởi tạo Chrome WebDriver port {self.debug_port}: {str(e)}")
+			
+def close_block_popup(self):
+    try:
+        popup = self.driver.find_element(By.XPATH, "//div[contains(@class, 'x1ey2m1c') and contains(@class, 'xds687c') and contains(@class, 'x17qophe') and contains(@class, 'xg01cxk') and contains(@class, 'x47corl') and contains(@class, 'x10l6tqk') and contains(@class, 'x13vifvy') and contains(@class, 'x1ebt8du') and contains(@class, 'x19991ni') and contains(@class, 'x1dhq9h') and contains(@class, 'xzolkzo') and contains(@class, 'x12go9s9') and contains(@class, 'x1rnf11y') and contains(@class, 'xprq8jg')]")
+        actions = ActionChains(self.driver)
+        actions.double_click(popup).perform()
+        time.sleep(1)
+        return True
+    except:
+        return False
 
     def check_checkpoint(self):
         try:
@@ -222,6 +234,12 @@ def process_single_group(chrome_instance, group_url, search_keywords, output_fil
     try:
         chrome_instance.driver.get(group_url)
         time.sleep(random.uniform(2, 3))
+		
+		# Thêm xử lý popup block
+        if chrome_instance.close_block_popup():
+            print(f"[Worker {chrome_instance.worker_id}] Đã đóng popup block")
+            time.sleep(random.uniform(1, 2))
+
 
         # Check if page loaded properly
         if "content not found" in chrome_instance.driver.page_source.lower() or "không tìm thấy nội dung" in chrome_instance.driver.page_source.lower():
