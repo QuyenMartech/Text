@@ -1,651 +1,844 @@
-import time
-from datetime import datetime
-import random
-import json
-import csv
-import re
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, WebDriverException, NoSuchWindowException
-from collections import defaultdict, deque
-from typing import Dict, List
-from selenium.webdriver.common.action_chains import ActionChains
-import os
-import threading
-import math
-
-
-# Configuration parameters
-MIN_DELAY_BETWEEN_REQUESTS = 0.5
-MAX_DELAY_BETWEEN_REQUESTS = 1
-MAX_RETRIES = 3
-PAGE_LOAD_TIMEOUT = 10
-TAB_SWITCH_DELAY = 0.2
-MAX_TABS = 5
-SCROLL_PAUSE_TIME = 2
-
-def calculate_std_dev(values):
-    n = len(values)
-    if n < 2:
-        return 0
-    mean = sum(values) / n
-    squared_diff_sum = sum((x - mean) ** 2 for x in values)
-    return math.sqrt(squared_diff_sum / (n - 1))
-
-class ChromeInstance:
-    def __init__(self, debug_port, worker_id):
-        self.debug_port = debug_port
-        self.worker_id = worker_id
-        self.driver = None
-        self.processed_count = 0
-        self.is_checkpoint = False
-        self.is_blocked = False
-        self.processed_groups = set()
-        self.collected_urls = []
-        self.failed_urls = []
-
-    def save_progress(self, keyword, urls, current_index, output_dir):
-        progress_file = os.path.join(output_dir, f'progress_worker_{self.worker_id}.json')
-        progress_data = {
-            'keyword': keyword,
-            'urls': urls,
-            'current_index': current_index,
-            'timestamp': datetime.now().isoformat()
-        }
-        try:
-            with open(progress_file, 'w', encoding='utf-8') as f:
-                json.dump(progress_data, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            print(f"[Worker {self.worker_id}] Lỗi lưu tiến độ: {str(e)}")
-
-    def load_progress(self, output_dir):
-        progress_file = os.path.join(output_dir, f'progress_worker_{self.worker_id}.json')
-        try:
-            if os.path.exists(progress_file):
-                with open(progress_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-        except Exception as e:
-            print(f"[Worker {self.worker_id}] Lỗi đọc tiến độ: {str(e)}")
-        return None
-
-    def clear_progress(self, output_dir):
-        progress_file = os.path.join(output_dir, f'progress_worker_{self.worker_id}.json')
-        try:
-            if os.path.exists(progress_file):
-                os.remove(progress_file)
-        except Exception as e:
-            print(f"[Worker {self.worker_id}] Lỗi xóa file tiến độ: {str(e)}")
-
-    def setup_chrome_driver(self):
-        chrome_options = Options()
-        chrome_options.add_experimental_option("debuggerAddress", f"127.0.0.1:{self.debug_port}")
-        chrome_options.add_argument('--no-sandbox')
-        chrome_options.add_argument('--disable-dev-shm-usage')
-        chrome_options.add_argument('--disable-gpu')
-        chrome_options.add_argument('--disable-notifications')
-        chrome_options.add_argument('--disable-infobars')
-        chrome_options.add_argument('--lang=vi')
-        return chrome_options
-
-    def create_driver(self):
-        try:
-            options = self.setup_chrome_driver()
-            service = Service()
-            self.driver = webdriver.Chrome(service=service, options=options)
-            self.driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
-            return self.driver
-        except Exception as e:
-            raise Exception(f"Lỗi khởi tạo Chrome WebDriver port {self.debug_port}: {str(e)}")
-
-    def close_block_popup(self):
-        try:
-            popup = self.driver.find_element(By.XPATH, "//div[contains(@class, 'x1ey2m1c') and contains(@class, 'xds687c') and contains(@class, 'x17qophe') and contains(@class, 'xg01cxk') and contains(@class, 'x47corl') and contains(@class, 'x10l6tqk') and contains(@class, 'x13vifvy') and contains(@class, 'x1ebt8du') and contains(@class, 'x19991ni') and contains(@class, 'x1dhq9h') and contains(@class, 'xzolkzo') and contains(@class, 'x12go9s9') and contains(@class, 'x1rnf11y') and contains(@class, 'xprq8jg')]")
-            actions = ActionChains(self.driver)
-            actions.double_click(popup).perform()
-            time.sleep(1)
-            return True
-        except:
-            return False
-
-    def check_checkpoint(self):
-        try:
-            current_url = self.driver.current_url.lower()
-            checkpoint_indicators = [
-                "facebook.com/checkpoint",
-                "facebook.com/recover",
-                "facebook.com/login",
-                "/login/?next",
-                "checkpoint/?next"
-            ]
-            return any(indicator in current_url for indicator in checkpoint_indicators)
-        except:
-            return False
-
-    def check_blocked(self):
-        try:
-            blocked_text = "Bạn tạm thời bị chặn"
-            blocked_text_2 = "Có vẻ như bạn đang dùng nhầm tính năng này do sử dụng quá nhanh"
-            page_source = self.driver.page_source
-            return blocked_text in page_source or blocked_text_2 in page_source
-        except:
-            return False
-
-    def check_suspicious(self):
-        try:
-            # Theo dõi URL hiện tại
-            current_url = self.driver.current_url.lower()
-            
-            # Nếu URL chứa checkpoint suspicious
-            if "facebook.com/checkpoint/601051028565049" in current_url:
-                # Tìm nút "Bỏ qua" hoặc "Dismiss"
-                skip_button = self.driver.find_elements(By.XPATH, "//span[contains(@class, 'x1lliihq') and contains(@class, 'x6ikm8r') and contains(@class, 'x10wlt62') and contains(@class, 'x1n2onr6') and contains(@class, 'xlyipyv') and contains(@class, 'xuxw1ft') and (contains(text(), 'Bỏ qua') or contains(text(), 'Dismiss'))]")
-                
-                if skip_button:
-                    try:
-                        actions = ActionChains(self.driver)
-                        actions.double_click(skip_button[0]).perform()
-                        print(f"[Worker {self.worker_id}] Đã click nút Bỏ qua trên trang Checkpoint")
-                        time.sleep(1)
-                        return True
-                    except Exception as e:
-                        print(f"[Worker {self.worker_id}] Lỗi khi click nút Bỏ qua: {str(e)}")
-                        return False
-            return False
-        except Exception as e:
-            print(f"[Worker {self.worker_id}] Lỗi khi kiểm tra trang suspicious: {str(e)}")
-            return False
-
-    # Thêm hàm mới để theo dõi URL
-    def url_monitor(self):
-        """Hàm theo dõi URL và xử lý checkpoint"""
-        try:
-            current_url = self.driver.current_url
-            if "facebook.com/checkpoint/601051028565049" in current_url.lower():
-                self.check_suspicious()
-        except Exception as e:
-            print(f"[Worker {self.worker_id}] Lỗi khi theo dõi URL: {str(e)}")
-
-    def scroll_and_collect_groups(self):
-        print(f"[Worker {self.worker_id}] Bắt đầu scroll và thu thập URLs...")
-        group_links = []  # Đổi từ set sang list để duy trì thứ tự
-        group_links_set = set()  # Dùng set để kiểm tra trùng lặp
-        no_new_content_count = 0
-        previous_unique_count = 0
-        last_height = self.driver.execute_script("return document.documentElement.scrollHeight")
-        
-        while True:
-            current_height = self.driver.execute_script("return window.pageYOffset")
-            target_height = min(current_height + 300, last_height)
-            self.driver.execute_script(f"window.scrollTo(0, {target_height});")
-            time.sleep(0.3)
-
-            time.sleep(SCROLL_PAUSE_TIME)
-            
-            actual_height = self.driver.execute_script("return window.pageYOffset")
-            if abs(actual_height - target_height) > 50:
-                self.driver.execute_script(f"window.scrollTo(0, {target_height});")
-                time.sleep(0.3)
-
-            elements = self.driver.find_elements(By.CSS_SELECTOR, "a[href*='/groups/']")
-            
-            new_urls_added = 0
-            for element in elements:
-                try:
-                    href = element.get_attribute('href')
-                    if href and re.search(r'facebook\.com/groups/\d+/?$', href):
-                        clean_url = re.sub(r'\?.*$', '', href)
-                        if clean_url not in self.processed_groups and clean_url not in group_links_set:
-                            group_links.append(clean_url)  # Thêm vào list để giữ thứ tự
-                            group_links_set.add(clean_url)  # Thêm vào set để kiểm tra trùng lặp
-                            new_urls_added += 1
-                except:
-                    continue
-            
-            current_unique_count = len(group_links)
-            print(f"[Worker {self.worker_id}] Đã tìm thấy {new_urls_added} nhóm mới (Tổng: {current_unique_count} nhóm độc nhất)")
-            
-            if current_unique_count == previous_unique_count:
-                no_new_content_count += 1
-                print(f"[Worker {self.worker_id}] Không tìm thấy nhóm mới... ({no_new_content_count}/8)")
-                if no_new_content_count >= 8:
-                    print(f"[Worker {self.worker_id}] Hoàn tất thu thập URLs sau 8 lần không có nhóm mới")
-                    break
-            else:
-                no_new_content_count = 0
-                previous_unique_count = current_unique_count
-
-            new_height = self.driver.execute_script("return document.documentElement.scrollHeight")
-            if new_height != last_height:
-                last_height = new_height
-                no_new_content_count = 0
-            elif abs(actual_height - last_height) < 100:
-                time.sleep(SCROLL_PAUSE_TIME * 2)
-                if abs(actual_height - self.driver.execute_script("return document.documentElement.scrollHeight")) < 100:
-                    print(f"[Worker {self.worker_id}] Đã đến cuối trang")
-                    break
-
-        print(f"[Worker {self.worker_id}] Tổng cộng đã thu thập được {len(group_links)} URLs độc nhất")
-        return group_links  # Trả về list thay vì set
-
-def save_group_urls(urls, keyword, output_dir, worker_id):
-    file_path = os.path.join(output_dir, f'collected_urls_worker_{worker_id}.json')
-    data = {
-        'keyword': keyword,
-        'timestamp': datetime.now().isoformat(),
-        'urls': urls,
-        'total_urls': len(urls)
-    }
-
-    try:
-        existing_data = []
-        if os.path.exists(file_path):
-            with open(file_path, 'r', encoding='utf-8') as f:
-                try:
-                    existing_data = json.load(f)
-                    if not isinstance(existing_data, list):
-                        existing_data = [existing_data]
-                except json.JSONDecodeError:
-                    existing_data = []
-        
-        # Tạo set của URLs đã tồn tại
-        existing_urls = set()
-        for entry in existing_data:
-            existing_urls.update(entry.get('urls', []))
-        
-        # Lọc URLs mới và giữ nguyên thứ tự
-        new_urls = [url for url in urls if url not in existing_urls]
-        if new_urls:
-            data['urls'] = new_urls
-            data['total_urls'] = len(new_urls)
-            existing_data.append(data)
-            
-            with open(file_path, 'w', encoding='utf-8') as f:
-                json.dump(existing_data, f, ensure_ascii=False, indent=2)
-            print(f"[Worker {worker_id}] Đã lưu {len(new_urls)} URLs mới vào file")
-        else:
-            print(f"[Worker {worker_id}] Không có URLs mới để lưu")
-            
-    except Exception as e:
-        print(f"Error saving URLs to JSON: {str(e)}")
-
-def save_failed_urls(failed_urls, output_dir, worker_id):
-    file_path = os.path.join(output_dir, f'failed_urls_worker_{worker_id}.json')
-    try:
-        with open(file_path, 'w', encoding='utf-8') as f:
-            json.dump({
-                'failed_urls': failed_urls,
-                'total_failed': len(failed_urls),
-                'timestamp': datetime.now().isoformat()
-            }, f, ensure_ascii=False, indent=2)
-        print(f"[Worker {worker_id}] Đã lưu {len(failed_urls)} URLs thất bại vào file")
-    except Exception as e:
-        print(f"Error saving failed URLs: {str(e)}")
-
-def convert_members_count(count_text):
-    try:
-        # Remove "thành viên", "members" text
-        count_text = count_text.lower().replace('thành viên', '').replace('members', '').strip()
-        
-        # Handle "triệu" (Vietnamese millions)
-        if 'triệu' in count_text.lower():
-            number = float(count_text.lower().replace('triệu', '').replace(',', '.').strip())
-            return int(number * 1000000)
-        
-        # Handle K (thousands)
-        if 'k' in count_text.lower():
-            number = float(count_text.lower().replace('k', '').replace(',', '.'))
-            return int(number * 1000)
-        
-        # Handle M (millions) 
-        if 'm' in count_text.lower():
-            number = float(count_text.lower().replace('m', '').replace(',', '.'))
-            return int(number * 1000000)
-            
-        # Handle B (billions)
-        if 'b' in count_text.lower():
-            number = float(count_text.lower().replace('b', '').replace(',', '.'))
-            return int(number * 1000000000)
-            
-        # Handle regular numbers
-        return int(count_text.replace(',', ''))
-    except:
-        return 0
-
-def process_single_group(chrome_instance, group_url, search_keywords, output_file, lock, retry_count=0):
-    print(f"[Worker {chrome_instance.worker_id}] Đang xử lý nhóm: {group_url}")
-    try:
-        chrome_instance.driver.get(group_url)
-        chrome_instance.url_monitor() 
-        
-        time.sleep(random.uniform(2, 3))
-
-        def handle_popup():
-            """Xử lý popup block"""
-            if chrome_instance.close_block_popup():
-                print(f"[Worker {chrome_instance.worker_id}] Đã đóng popup block")
-                time.sleep(random.uniform(1, 2))
-                return True
-            return False
-
-        # Check popup sau khi load trang
-        time.sleep(1)
-        handle_popup()
-
-        if "content not found" in chrome_instance.driver.page_source.lower() or "không tìm thấy nội dung" in chrome_instance.driver.page_source.lower():
-            if retry_count < MAX_RETRIES:
-                time.sleep(random.uniform(1, 3))
-                return process_single_group(chrome_instance, group_url, search_keywords, output_file, lock, retry_count + 1)
-            else:
-                raise Exception("Không thể tải trang sau nhiều lần thử")
-
-        try:
-            group_name_element = WebDriverWait(chrome_instance.driver, 2).until(
-                EC.presence_of_element_located((By.XPATH, "//h1//a[contains(@class, 'x16tdsg8')]"))
-            )
-            group_name = group_name_element.text.strip()
-        except:
-            if retry_count < MAX_RETRIES:
-                time.sleep(random.uniform(1, 2))
-                return process_single_group(chrome_instance, group_url, search_keywords, output_file, lock, retry_count + 1)
-            else:
-                raise Exception("Không thể lấy tên nhóm")
-
-        try:
-            group_type_element = WebDriverWait(chrome_instance.driver, 1).until(
-                EC.presence_of_element_located((By.XPATH, "//div[contains(text(), 'Nhóm') and contains(@class, 'x1n2onr6')]"))
-            )
-            group_type = group_type_element.text.strip()
-        except:
-            group_type = "Unknown"
-
-        try:
-            members_element = WebDriverWait(chrome_instance.driver, 1).until(
-                EC.presence_of_element_located((By.XPATH, "//a[contains(@href, '/members/')]"))
-            )
-            members_text = members_element.text
-            members_match = re.search(r'([\d,\.]+[KMB]?) thành viên', members_text)
-            members_count = members_match.group(1) if members_match else "0"
-        except:
-            if retry_count < MAX_RETRIES:
-                time.sleep(random.uniform(1, 2))
-                return process_single_group(chrome_instance, group_url, search_keywords, output_file, lock, retry_count + 1)
-            else:
-                raise Exception("Không thể lấy số lượng thành viên")
-
-        numeric_members_count = convert_members_count(members_count)
-
-        try:
-            can_post = "No"
-            try:
-                post_box_vn = WebDriverWait(chrome_instance.driver, 2).until(
-                    EC.presence_of_element_located((By.XPATH, '//span[@class="x1lliihq x6ikm8r x10wlt62 x1n2onr6" and contains(text(), "Bạn viết gì đi...")]'))
-                )
-                can_post = "Yes"
-            except:
-                try:
-                    post_box_en = WebDriverWait(chrome_instance.driver, 2).until(
-                        EC.presence_of_element_located((By.XPATH, '//span[@class="x1lliihq x6ikm8r x10wlt62 x1n2onr6" and contains(text(), "Write something...")]'))
-                    )
-                    can_post = "Yes"
-                except:
-                    can_post = "No"
-        except Exception as e:
-            print(f"[Worker {chrome_instance.worker_id}] Lỗi khi kiểm tra quyền đăng bài: {str(e)}")
-            can_post = "No"
-
-        # Thực hiện scroll
-        num_scrolls = random.randint(1, 3)
-        for i in range(num_scrolls):
-            chrome_instance.driver.execute_script("window.scrollBy(0, 600)")
-            time.sleep(random.uniform(0.5, 1))
-            
-            # Check popup sau lần scroll đầu tiên
-            if i == 0:
-                time.sleep(1)
-                handle_popup()
-
-        group_data = {
-            'keyword_search': search_keywords,
-            'group_name': group_name,
-            'group_link': group_url,
-            'group_type': group_type,
-            'members_count': numeric_members_count,
-            'can_post': can_post
-        }
-
-        with lock:
-            try:
-                write_header = not os.path.exists(output_file)
-                with open(output_file, 'a', newline='', encoding='utf-8-sig') as f:
-                    writer = csv.DictWriter(f, fieldnames=list(group_data.keys()))
-                    if write_header:
-                        writer.writeheader()
-                    writer.writerow(group_data)
-                print(f"[Worker {chrome_instance.worker_id}] Đã lưu thành công nhóm: {group_name}")
-                return True
-            except Exception as e:
-                print(f"[Worker {chrome_instance.worker_id}] Lỗi lưu dữ liệu: {str(e)}")
-                return False
-
-    except Exception as e:
-        print(f"[Worker {chrome_instance.worker_id}] Lỗi xử lý nhóm {group_url}: {str(e)}")
-        chrome_instance.failed_urls.append({
-            'url': group_url,
-            'error': str(e),
-            'timestamp': datetime.now().isoformat()
-        })
-        if retry_count < MAX_RETRIES:
-            time.sleep(random.uniform(1, 2))
-            return process_single_group(chrome_instance, group_url, search_keywords, output_file, lock, retry_count + 1)
-        return False
-
-def worker_process(chrome_instance: ChromeInstance, keywords: List[str], processed_items: set, processed_groups: set, lock, output_dir):
-    try:
-        driver = chrome_instance.create_driver()
-        output_file = os.path.join(output_dir, 'groups_data.csv')
-        retry_count = 0
-
-        # Kiểm tra và load tiến độ trước đó
-        progress_data = chrome_instance.load_progress(output_dir)
-        if progress_data:
-            print(f"[Worker {chrome_instance.worker_id}] Tìm thấy tiến độ trước đó:")
-            print(f"- Keyword: {progress_data['keyword']}")
-            print(f"- Số URL còn lại: {len(progress_data['urls']) - progress_data['current_index']}")
-            
-            # Tiếp tục xử lý các URL còn lại từ lần trước
-            total_remaining = len(progress_data['urls']) - progress_data['current_index']
-            processed_urls = 0
-            failed_urls = 0
-            
-            for idx, group_url in enumerate(progress_data['urls'][progress_data['current_index']:], 1):
-                if group_url in processed_groups:
-                    processed_urls += 1
-                    continue
-
-                print(f"[Worker {chrome_instance.worker_id}] Đang xử lý nhóm còn lại {idx}/{total_remaining}")
-                
-                if process_single_group(chrome_instance, group_url, progress_data['keyword'], output_file, lock):
-                    with lock:
-                        processed_groups.add(group_url)
-                        chrome_instance.processed_groups.add(group_url)
-                    processed_urls += 1
-                else:
-                    failed_urls += 1
-
-                # Lưu tiến độ sau mỗi URL
-                chrome_instance.save_progress(
-                    progress_data['keyword'],
-                    progress_data['urls'],
-                    progress_data['current_index'] + idx,
-                    output_dir
-                )
-
-                time.sleep(random.uniform(MIN_DELAY_BETWEEN_REQUESTS, MAX_DELAY_BETWEEN_REQUESTS))
-
-            # Xóa file tiến độ sau khi hoàn thành
-            chrome_instance.clear_progress(output_dir)
-            print(f"[Worker {chrome_instance.worker_id}] Đã hoàn thành xử lý các URL còn lại")
-
-        while True:
-            if chrome_instance.check_checkpoint():
-                chrome_instance.is_checkpoint = True
-                print(f"[Worker {chrome_instance.worker_id}] Tài khoản bị checkpoint, dừng worker")
-                break
-
-            if chrome_instance.check_blocked():
-                chrome_instance.is_blocked = True
-                print(f"[Worker {chrome_instance.worker_id}] Tài khoản bị chặn tạm thời, dừng worker")
-                break
-            
-            if chrome_instance.check_suspicious():
-                print(f"[Worker {chrome_instance.worker_id}] Đã xử lý cảnh báo suspicious")
-                time.sleep(random.uniform(1, 2))
-                continue
-
-            with lock:
-                if len(keywords) < 2:
-                    break
-                selected_keywords = random.sample(keywords, 2)
-                search_keywords = ' '.join(selected_keywords)
-
-            if search_keywords in processed_items:
-                continue
-
-            try:
-                encoded_keywords = '%20'.join(search_keywords.split())
-                search_url = f"https://www.facebook.com/groups/search/groups?q={encoded_keywords}&filters=eyJwdWJsaWNfZ3JvdXBzOjAiOiJ7XCJuYW1lXCI6XCJwdWJsaWNfZ3JvdXBzXCIsXCJhcmdzXCI6XCJcIn0ifQ%3D%3D"
-
-                print(f"\n[Worker {chrome_instance.worker_id}] Tìm kiếm với từ khóa: {search_keywords}")
-                driver.get(search_url)
-                time.sleep(random.uniform(2, 3))
-
-                group_urls = chrome_instance.scroll_and_collect_groups()
-                if not group_urls:
-                    print(f"[Worker {chrome_instance.worker_id}] Không tìm thấy URLs cho từ khóa: {search_keywords}")
-                    continue
-
-                save_group_urls(group_urls, search_keywords, output_dir, chrome_instance.worker_id)
-
-                total_urls = len(group_urls)
-                processed_urls = 0
-                failed_urls = 0
-
-                print(f"[Worker {chrome_instance.worker_id}] Bắt đầu xử lý {total_urls} nhóm...")
-                
-                for idx, group_url in enumerate(group_urls, 1):
-                    if group_url in processed_groups:
-                        processed_urls += 1
-                        continue
-
-                    print(f"[Worker {chrome_instance.worker_id}] Đang xử lý nhóm {idx}/{total_urls}")
-                    
-                    # Lưu tiến độ trước khi xử lý mỗi URL
-                    chrome_instance.save_progress(
-                        search_keywords,
-                        group_urls,
-                        idx - 1,
-                        output_dir
-                    )
-                    
-                    if process_single_group(chrome_instance, group_url, search_keywords, output_file, lock):
-                        with lock:
-                            processed_groups.add(group_url)
-                            chrome_instance.processed_groups.add(group_url)
-                        processed_urls += 1
-                    else:
-                        failed_urls += 1
-
-                    time.sleep(random.uniform(MIN_DELAY_BETWEEN_REQUESTS, MAX_DELAY_BETWEEN_REQUESTS))
-
-                # Xóa file tiến độ sau khi hoàn thành keyword
-                chrome_instance.clear_progress(output_dir)
-
-                print(f"[Worker {chrome_instance.worker_id}] Kết quả xử lý keyword '{search_keywords}':")
-                print(f"- Tổng số URLs: {total_urls}")
-                print(f"- Đã xử lý: {processed_urls}")
-                print(f"- Thất bại: {failed_urls}")
-
-                chrome_instance.processed_count += 1
-                with lock:
-                    processed_items.add(search_keywords)
-                    if chrome_instance.processed_count % 10 == 0:
-                        save_progress(processed_items, processed_groups, output_dir)
-
-            except Exception as e:
-                print(f"[Worker {chrome_instance.worker_id}] Lỗi xử lý từ khóa {search_keywords}: {str(e)}")
-                retry_count += 1
-                if retry_count >= MAX_RETRIES:
-                    print(f"[Worker {chrome_instance.worker_id}] Đã vượt quá số lần thử lại cho phép")
-                    break
-                time.sleep(random.uniform(2, 4))
-
-    except Exception as e:
-        print(f"[Worker {chrome_instance.worker_id}] Lỗi: {str(e)}")
-    finally:
-        if chrome_instance.failed_urls:
-            save_failed_urls(chrome_instance.failed_urls, output_dir, chrome_instance.worker_id)
-        if chrome_instance.driver:
-            chrome_instance.driver.quit()
-
-def load_keywords(file_path):
-    with open(file_path, 'r', encoding='utf-8') as f:
-        return [line.strip() for line in f.readlines() if line.strip()]
-
-def load_progress(output_dir):
-    try:
-        with open(os.path.join(output_dir, 'scan_progress.json'), 'r') as f:
-            data = json.load(f)
-            return data.get('processed_items', []), set(data.get('processed_groups', []))
-    except:
-        return [], set()
-
-def save_progress(processed_items, processed_groups, output_dir):
-    with open(os.path.join(output_dir, 'scan_progress.json'), 'w') as f:
-        json.dump({
-            'processed_items': list(processed_items),
-            'processed_groups': list(processed_groups)
-        }, f)
-
-def main():
-    input_file = r'C:\Users\Admin\Downloads\Tìm Group Công Khai\Keyword.txt'
-    output_dir = r'C:\Users\Admin\Downloads\Tìm Group Công Khai\output'
-
-    os.makedirs(output_dir, exist_ok=True)
-
-    keywords = load_keywords(input_file)
-    processed_items, processed_groups = load_progress(output_dir)
-    processed_items = set(processed_items)
-
-    print(f"Tổng số keywords: {len(keywords)}")
-
-    chrome_instances = [
-        ChromeInstance(debug_port=9222, worker_id=1),
-        ChromeInstance(debug_port=9223, worker_id=2),
-        ChromeInstance(debug_port=9224, worker_id=3),
-        ChromeInstance(debug_port=9225, worker_id=4),
-        ChromeInstance(debug_port=9226, worker_id=5),
-        ChromeInstance(debug_port=9227, worker_id=6)
-    ]
-
-    lock = threading.Lock()
-
-    threads = []
-    for chrome_instance in chrome_instances:
-        thread = threading.Thread(
-            target=worker_process,
-            args=(chrome_instance, keywords, processed_items, processed_groups, lock, output_dir)
-        )
-        threads.append(thread)
-        thread.start()
-
-    for thread in threads:
-        thread.join()
-
-    print("\nHoàn tất xử lý!")
-
-if __name__ == "__main__":
-    main()
+Feeling Safe Within Your Body (Guided Meditation)
+Just Be Exactly As You Are (Guided Meditation)
+Your Life, Your Choice... Designing Your Destiny (Guided Meditation)
+Improved Focus (Guided Meditation)
+Journey to Your Inner Light,  A Soul Connection Meditation
+Morning Energy Cleanse
+Manifest Your Dream Home While You Sleep (Guided Sleep Meditation)
+Finding Peace in the Present Moment (Guided Meditation)
+This Meditation Will Put You Into A Deep State of Inner Calm
+Be One With the Breath (10 Minute Guided Meditation)
+A High Vibrational Guided Meditation Practice
+You've Got This! (Morning Meditation)
+Inner Child Healing and Forgiveness (15 Minute Guided Meditation)
+Listen to Your Spirit Guide (Guided Meditation)
+No More Brain Fog (Guided Meditation)
+10 Minute Meditation to Relax the Mind
+Awakening Your Inner Light (Guided Meditation)
+In With the New (Guided Meditation)
+Receive A Message from Your Higher Self (Guided Meditation)
+Take The Next 5 Minutes and Just Be (Guided Meditation)
+Let the Energy Light you Up (Guided Meditation)
+A Guide to Self Love (5 Minute Meditation)
+Energy Cleanse for Radiant Energy (Guided Meditation)
+You Will Have a Bright Future (Guided Meditation)
+Self Healing While You Sleep Meditation
+Becoming One with the Light (Guided Meditation)
+It is Safe to be Me (Guided Meditation)
+Reclaiming Your Power While You Sleep Tonight (Guided Meditation)
+It's Time to Relax, 20 Minute Guided Meditation
+Manifesting True Love (Guided Meditation)
+A Message from your Future Self (Guided Meditation)
+All is Well, Morning Meditation
+Today You are Radiant, Morning Meditation
+You Are Powerful... A 10 Minute Guided Meditation
+Push the Reset Button and Start Your Life a Fresh (Guided Meditation)
+Morning Abundance Guided Meditation
+A Powerful Meditation to Fall Asleep
+Letting Go so You Can Move Forward (Guided Meditation)
+It just is... A Guided Meditation for Non Judgement
+A Powerful Self Love Guided Meditation
+Be at Peace  (Guided Meditation)
+No Future... No Past... Just Be  (Guided Meditation)
+Program Your Mind for Mental Clarity & Focus (Guided Meditation)
+All Is Well in This Moment... There is Nothing You Need  (Guided Meditation)
+A 10 Minute Meditation With Your Spirit Guided
+I AM Affirmations for Wisdom & Growth (Guided Meditation)
+My Chakras Are Aligned (Guided Meditation)
+Morning Meditation to Embrace the Day Ahead
+I Am Wealthy Guided Meditation with Affirmations
+You Have Come So Far... It's Time to be Grateful (Guided Meditation)
+Wake Up to a Mindful State of Being Guided Meditation
+Relaxed Body, Calm Mind (20 Minute Sleep Meditation)
+May Your Wishes Come True... You Are Amazing! (Guided Meditation)
+Grounding Yourself into Positive Energy (15 Minute Guided Meditation)
+Stop Thinking & Start Being (Guided Meditation)
+Feel the Beauty Within You Guided Meditation
+Feel The Energy (10 Minute Guided Meditation)
+Empowerment Through Your Higher Self (Guided Meditation)
+Clear Your Mind So You Can Choose Your Thoughts Wisely
+Feel Great About You and Your Life Guided Meditation
+You Are Worthy of Unconditional Self Love (Guided Meditation)
+Go Within to Find Inner Peace (Guided Meditation)
+10 Minute Anxiety Relief (Guided Meditation)
+Are You Starting to Lose Hope?  (Try This Guided Meditation)
+Receive Wisdom from your Higher Self (Guided Meditation)
+Positive Subconscious Reprograming While You Sleep Meditation
+Evolving Through Life's Cycles 10 Minute Guided Meditation
+A Guided Meditation for Releasing Guilt
+A 10 minute Guided Meditation for your Overactive Mind
+A Mindfulness Journey, Becoming Aware of the Present Moment!
+Morning Affirmations for Personal Growth
+Grounding & Protecting Your Energy (Guided Meditation)
+Opening Yourself to Receive Love (Guided Meditation)
+Nourishing Your Growth - Guided Meditation
+Starting Fresh with Gratitude!   A Morning Meditation
+Connecting with the Universe A Meditation for Oneness
+A Guided Meditation for Inner Calm
+Setting a Positive Tone for the Day (Morning Guided Meditation)
+A Message Is Waiting for You...  Listen to Receive! (Guided Meditation)
+A Deeply Relaxing 10 Minute Guided Meditation
+Improve Your Energy (Guided Meditation)
+10 Minute Focus Guided Meditation
+Morning Meditation for Manifesting a Rich & Luxurious Life!
+Listen to Your Heart (Guided Meditation)
+This Guided Meditation will Help You Experience More Abundance in Your Life!
+Grounding & Cleansing Your Energy Guided Meditation
+Morning Meditation for Living a Miraculous Life
+10 Minute Guided Meditation for Stress & Anxiety
+Taking Ownership Over Your Happiness! (Guided Meditation)
+The Greatness that is about to Unfold for You Today ~ Morning Meditation
+Improve Memory and Focus (Guided Meditation)
+You Will Have Loving Dreams Tonight! (Guided Sleep Meditation)
+A Guided Meditation for Stepping into the Next Chapter of Your Life!
+20 Minute Guided Meditation Before You Sleep!
+Receive Your Blessings Right Now!  (Guided Meditation)
+Morning Meditation with Positive Affirmations to Start Your Day!
+Sleep Easy Knowing Everything Is Going to be OK!  (Guided Meditation)
+Increase Your Happiness with Gratitude!  (Guided Meditation)
+You  will be OK!  (10 Minute Guided Meditation)
+Take a Journey into Deep Relaxation (Guided Meditation)
+15 Minute Energy Cleanse (Guided Meditation)
+Gratitude for the Blessings Coming Your Way! (Guided Meditation)
+Receiving Guidance from your Spirit Guide (Guided Meditation)
+Powerful Healing of the Void Space (Guided Meditation)
+Morning Visualization to Greet Today Full of Radiant Joy and Wonder!
+Live a Blessed Life Utilizing the Energy of the Solar Eclipse (Guided Meditation)
+30 Minute Sleep Meditation ~ Manifest All You Desire While You Sleep!
+Become Like Air ~ 10 Minute Guided Meditation
+I Have Everything I Need... Knowing More is Yet to Come! (Guided Meditation)
+A Guided Meditation for Difficult Times
+A Daily 5 Minute Meditation Practice to Benefit All Areas of Your Life
+Infusing Positive Energy into Your Daily Intentions (Morning Guided Meditation)
+Guided Visualization Meditation
+Manifest Your Dreams! A Guided Journey to Abundance (10 minute  meditation)
+10 Minute Meditation for Letting go!
+10 Minute Heart Cleansing (Guided Meditation)
+Accessing the Ancient Wisdom of the Breath (Guided Meditation)
+Live in Peace Knowing Everything Will Be OK! (Guided Meditation)
+Calm Your Mind, 20 Minute Guided Meditation for Stress & Anxiety
+Healing Your Inner Child (Guided Meditation)
+Your Life's Journey Guided Visualization Meditation
+Healing White Light (Guided Meditation)
+Positive Change is Coming Your Way! (Guided Meditation)
+A Journey to Inner Peace (10 Minute Guided Meditation)
+Deep Relaxation for the Mind & Body (Guided Meditation)
+Finding Your Worthiness (Guided Meditation)
+A Newfound Energy that will Ripple Through Your Day (Morning Meditation)
+Enter a Deep Sleep while Connecting to your Higher Self (Guided Meditation)
+Become the Ruler of Your Inner Kingdom (10 Minute Guided Meditation)
+Morning Meditation for a Productive & Successful Day
+Calm Your Mind with Moments of Silence (Guided Meditation)
+Remove all  Self Doubts and Insecurities (Guided Meditation)
+You Will Experience a Year full of Miracles! (Guided Meditation)
+20 Minute Chakra Balance & Cleansing Guided Meditation
+Guided Meditation: Becoming the Best Version of You!
+Morning Meditation with Positive Affirmations for an Empowering Day!
+Sleep Well Knowing Everything is Working out for You!  (Guided Sleep Meditation)
+Set Your Intentions for a Prosperous Year! (Guided Meditation)
+Morning Moments of Gratitude: A 10 Minute Guided Meditation
+Guided Meditation to Improve Your Focus! Level: Intermediate
+A Fresh New Start: This Will Be Your Year! (Guided Meditation)
+Keeping MOTIVATED by Visualizing your Goals (Guided Meditation)
+Give Me Strength (20 Minute Guided Meditation)
+10 Minute Meditation for Cleansing the Heart
+Morning Meditation full of Love & Positive Energy
+20 Minute Guided Meditation for Inner Stillness
+Guided Meditation for Social Anxiety
+Receive the Answers You've Been Looking For! (Guided Meditation)
+Program Yourself for Success (20 Minute Guided Meditation)
+5 Minute Morning Meditation for a Magical Day full of Golden Light
+Give Yourself The Greatest Gift of All (10 Minute Guided Meditation)
+Receiving Gifts of Inspiration (20 Minute Guided Meditation)
+Finding Peace During the Holidays (Guided Meditation)
+Guided Meditation: Enlightened by Gratitude
+Tune Into Your Center, 20 Minute Guided Meditation
+Entering the Void Space Guided Meditation
+Clear Your Mind, A Guided Mindfulness Meditation
+Love Energy (Guided Meditation)
+A Powerful Connection to Self (Guided Meditation)
+Expand Your Mind 10 Minute Guided Meditation
+Quickly Fall Asleep (Guided Sleep Meditation)
+Guided Meditation: In This Moment You Are Free!
+Morning Meditation: A Message from Your Heart
+Sleep Meditation: A calming way to fall asleep
+Guided Meditation: Awaken Something from Within You
+Morning Meditation Planting Your Intentions for the Day
+A Powerful 30 Minute Grounding Energy Guided Meditation
+I Am Made New in This Moment (Guided Meditation)
+Morning Meditation for Positive Energy
+Letting Go of Negative Self Talk  (Guided Meditation)
+Good Things Are Awaiting for you! Your Next Life's Chapter (Guided Meditation)
+A Morning Miracle 10 Minute Guided Meditation
+Receive All Life Has To Offer ~ 10 Minute Manifesting Meditation
+10 Minute Deep Relaxation Guided Meditation
+You Are More Than You Think You Are (Guided Meditation)
+Living Your Truth:  Embrace Your Authentic Self (Guided Meditation)
+10 Minute Chakra Healing Guided Meditation
+10 Minute Energy Healing (Guided Meditation)
+Becoming the Best Version of Yourself While You Sleep (Guided Sleep Meditation)
+Today I will Love... and be Loved!  (Guided Meditation)
+Clearing Your Mind Becoming Present to the moment (Guided Meditation)
+I Am Abundant (Guided Meditation)
+A Journey into Source Energy: Awakening Intuition (Guided Meditation)
+A 10 Minute Morning Meditation for Self Love
+Healing Positive Energy 20 Minute Guided Meditation
+Start Your Day with Gratitude: A Morning Guided Meditation
+Mindful Morning: Start Your Day with Clarity and Calm (Guided Meditation)
+Your Higher Self has a Message for You!  10 Minute Guided Meditation
+A Great Future Awaits for You!  (Guided Meditation)
+Improve Your Mood and Overall Well-Being (10 Minute Guided Meditation)
+A Renewed Sense of Mind, Body, and Spirit (Guided Meditation)
+Infuse Your Morning with a Sense of Joy that Ripples Through Your Entire Day (Guided Meditation)
+Before You Sleep 5 Minute Meditation
+Meet Your Spirit Animal (Guided Meditation)
+Manifesting Your Dream Life Begins Today! (Guided Meditation)
+You Need to be More Kind With Yourself  (Guided Meditation)
+Powerful I Am Affirmations While You Sleep
+Take a 10 Minute Relaxation Vacation (Guided Meditation)
+Heart Chakra Energy Healing (10 Minute Guided Meditation)
+20 Minute Journey to Inner Peace & Deep Relaxation (Guided Meditation)
+Unwind Your Mind  (Guided Meditation) for Mental Clarity and Renewal
+Positive Energy Morning Meditation
+10 Minutes Just for Me (Guided Meditation)
+A Journey of Letting Go and Becoming the New You (Guided Meditation)
+Guided 20 Minute Sleep Meditation
+Energy Healing Guided Meditation for the Lion's Gate Portal
+A Guided Journey to Inner Calm & Stillness (guided meditation)
+Re-igniting Sparks of Passion (Morning Meditation)
+A Better Path Forward: Your Life's Journey  (Guided Meditation)
+Access the Lost Wisdom of your Inner Child (10 Minute Guided Meditation)
+Discovering the Peace Within: A Guided Meditation for Quieting the Mind
+From Self-Criticism to Self-Empowerment: A Positive Self Image for a New You (Guided Meditation)
+Let Your Soul Awaken to the Symphony of Endless Possibilities (Morning Meditation)
+A Deep Relaxation Meditation That Will Take You to a New Reality
+Today's Gift: My Best Self (Morning  Meditation)
+Going Deep Within (Guided Meditation)
+Experience 10 Minutes of Unconditional Love (Guided Meditation)
+Feel Your Life's Vision Come True! Guided Meditation for Manifestation
+10 Minutes Before Sleep (Guided Meditation)
+10 Minute Self Compassion Guided Meditation
+Morning Meditation for Positive Energy
+Finding Happiness Guided Meditation
+A Powerful 20 Minute Guided Meditation
+Living with a Sense of Ease Guided Meditation
+You Are Worthy (Guided Meditation)
+Guided Meditation ~ The Gift of Letting Go
+Healing Energy Guided Meditation
+Start Your Day Connected to Source Energy Guided Meditation
+A Powerful Expanding 10 Minute Guided Meditation
+Align With What You Desire, 10 Minute Manifestation Meditation
+Wind Down Before Sleep Guided Meditation
+You are More than just Your Ego, 10 Minute Guided Meditation
+Releasing & Letting Go of Other's Negativity and Bad Energy (Guided Meditation)
+Quiet the Mind & Becoming Present, 10 Minute Guided Meditation
+20 Minute Sleep Meditation
+Entering a Deeper State of Meditation
+Have a Beautiful Day, 10 Minute Morning Meditation
+Feel Supported on your Life Adventures (Guided Meditation)
+Breath & Body 15 Minute Guided Meditation
+A Deeper Connection with Your Higher Self  (Guided Meditation)
+A 10-Minute Journey to Inner Peace | Guided Meditation
+Sending You Love and Light ~ 10 minute guided meditation
+Positive Affirmations for Personal Growth (Guided Meditation)
+Five Minute Guided Meditation for Anxiety
+Grateful for this New Day, Guided Morning Meditation
+Change Your Reality While You Sleep, Guided Meditation
+A Deep 15 Minute Guided Meditation, Become Like Space
+Fill Yourself with Morning Energy as you Start Your Day  (Guided Meditation)
+Today I Remember to Choose Love!  Guided Meditation
+Morning Meditation for Acceptance & Belonging
+Improve Your Focus for Beginners  Guided Meditation
+15 Minute Guided Meditation for Inner Exploration: A Path to Discovery
+10 Minute Chakra Balance Guided Meditation for Positive Energy
+You Have a Bright Future Ahead of You!   Guided Meditation
+When you feel insignificant, Remember... You Are the Cosmos!  Guided Meditation
+20 Minute Guided Meditation for Manifesting Your Desired Reality
+I Choose to Feel Grateful, 10 Minute Guided Meditation
+Morning Meditation to Access Your Inner Child Confidence!
+~ Feels Like Floating ~ Guided Meditation
+The Powerful Release of Letting Go!  Guided Meditation
+I Choose Growth, Guided Meditation for a Positive Mindset
+Becoming the Highest Most Loving Version of You!  Guided Meditation
+Inner Peace & Happiness: Guided Meditation
+Guided Meditation When You're Starting to Feel Burned Out...
+Your New Beginning Starts Now, Guided Meditation
+My Daily10 Minute Guided Meditation Practice
+Receiving Love from your Spiritual Self, Guided Meditation
+A Great Morning Meditation to Ease into Your Day
+Rewrite Your Story and Create a Better Future... Guided Meditation
+Guided Meditation for Making Positive Changes in your Life
+A Journey to a Special Place, Guided Meditation
+Positive Energy 10 minute Guided Meditation
+Just You and Your Breath, a 10 Minute Guided Meditation
+May You be Fully Present in this Moment, 20 Minute Guided Meditation
+Morning Visualization for a Successful & Productive Day,  Guided Meditation
+Energy Healing ~ Guided Meditation
+Manifesting Morning Miracles, 10 Minute Guided Meditation
+20 Minute Relaxation, Guided Meditation, A Calming Beach Visualization
+This Spiritual Guided Meditation Will Help You Reach a Higher State of Being
+Transform Your Mindset and Elevate Your Life:  Morning Guided Meditation
+This Road Will Lead You Where You Want to Go!   Guided Meditation
+Deep Relaxation Guided Sleep Meditation
+Powerful Morning I Am Affirmations for Positive Self Development  (Guided Meditation)
+10 Minute Sleep Meditation A Guided Talk Down Body Scan
+If You Are Open, You Will Receive... A 10 Minute Abundance Meditation.
+Take a Journey Beyond Your Limits: A Guided Meditation for Expanding Consciousness
+Have a Wonderful Day, Morning  Meditation Full of Joy & Happiness!
+15 Minute Chakra Balance Guided Meditation
+You are Deserving of all these Good Things!  (Guided Meditation)
+Discover the Value of Just Being; Guided Meditation
+Wealth & Abundance: 10 Minute Guided Meditation
+5 Minute Heart Healing Guided Meditation
+A Guided Meditation for when you feel Disconnected or Lonely
+Inviting in the Light: A Morning Guided Meditation
+Starting Your Day with a Clear Mind: A Morning Mindfulness Practice
+Attracting More Positive People into your Life Guided Meditation
+Your life will become Amazing once you Realize this (Guided Meditation)
+Meet your Spirit Guide (Guided Meditation)
+Become the Center of Your Universe Guided Meditation
+Ten Minute Mindfulness  Guided Meditation for Focus
+Manifesting That Which is Meant to Be Yours  (Guided Meditation)
+Mindfulness for Overthinking Guided Meditation
+5 Minute Morning Meditation, You are on a Journey, Enjoy the Process!
+Clear Your Mind with Binaural Beats, Theta Waves (Guided Meditation)
+Sacral Chakra Guided Meditation for Inspiration & Creativity.
+Energy Cleansing (Guided Meditation) for Positive Energy
+Allow Your Life to Blossom Guided Meditation
+Guided Meditation for Thankfulness, Gratitude & Appreciation
+Guided Meditation for Successful Energy
+Overcoming Life's Obstacles (Difficult Situations) Guided Meditation
+Receive Today's Treasure,  Morning Meditation
+10 Minute Sleep Meditation with Positive Affirmations
+Self Care for the Mind & Body  (Guided Meditation)
+Setting Todays Goals & Intentions, Morning Meditation
+Guided Meditation to access your inner world of tranquility
+Mind & Body, Deep Relaxation (Guided Meditation)
+Guided Meditation Loving Positive Energy
+Morning Meditation - For Those Who Allow Shall Be Rewarded
+10 Minute Golden Light Guided Meditation
+Morning Meditation to Flow with Life
+Take Control of Your Life Guided Meditation
+10 Minute Sleep Meditation with Positive Messages
+You are on your own Hero's Journey (10 minute Guided Meditation)
+Supernatural 10 minute Guided Meditation
+Your Best Self 10 minute Guided Meditation
+5 Minutes before you Sleep Guided Meditation to End Your Day
+Manifesting Your Desires into Reality Guided Meditation
+Cosmic Light Energy Guided Meditation
+Powerful Guided Meditation to Start Your Week
+Feel Great All Day 10 Minute Guided Meditation
+5 Minute Guided Meditation When You're Not Feeling Your Best
+Calm Your Overthinking Mind, 10 Minute Guided Meditation
+Living with Purpose 10 Minute Guided Meditation
+Morning Positive Energy Guided Meditation
+Evening Meditation to End Your Day Before You Sleep
+A Guided Meditation When You're Feeling Anxiety
+Productive Morning Guided Meditation
+Attracting Miracles Guided Meditation
+A Healing Meditation for Continued Health & Wellness
+5 Minute Mirror Gazing Guided Meditation for Self Esteem, Self Love & Acceptance
+Cleansing Negative Energy with White Light Guided Meditation
+Thankfulness, A Time of Gratitude, Guided Meditation
+Feel Good in this Moment Guided Meditation
+Reconnecting with your Inner Child Guided Meditation
+5 Minute Morning Positive Energy ~ Guided Meditation
+The Best Has Yet to Come (Guided Meditation)
+Becoming One With Everything Guided Meditation
+Ten Minute Meditation When You Can't Sleep
+20 Minute Guided Meditation for Inner Wisdom & Positive Energy
+Connecting to Source Energy (Guided Meditation)
+Guided Meditation for feeling Supported
+Morning Meditation for Purpose & Passion
+Guided Meditation Allow Yourself to Just Be
+Emotional Mindfulness Guided Meditation
+Start your Morning with High Frequency Positive Vibes.  (Guided Meditation)
+Try this 5 Minutes Right Before you Sleep (Guided Meditation)
+A 10 Minute Cleansing Meditation
+10 minute morning meditation for Abundance, Wealth, and Success
+A Spiritual Transformation Guided Meditation
+10 Minute Guided Meditation When You're Feeling Negative
+Attracting Positivity into Your Life Guided Meditation
+A Positive Sleep Talk Down (Guided Meditation)
+Calm Your Mind in 5 Minutes (Guided Meditation)
+10 Minute Guided Meditation ~ Nothing Else Matters
+White Light Guided Meditation
+Letting Go Ten Minute Guided Meditation
+Connecting to Source Energy Guided Meditation
+10 Minute Guided Meditation for a Healthy Mindset
+Powerful Morning Affirmations 10 Minute Guided Meditation
+5 Minute Moring Meditation ~ I Have All I Need
+A Guided Meditation for Self Care
+Entering A Place of Joy (Guided Meditation)
+The Miracle Within You  Guided Meditation
+Open to Receive 15 Minute Guided Meditation
+Cycles of Life 5 Minute Spiritual Meditation
+A Place of Stillness 10 Minute Guided Meditation
+A Guided Meditation for The Highest Most Loving Good
+Powerful Morning 10 Minute  Guided Meditation
+Sleep... 10 Minute  Guided Meditation
+Feel the Energy of Abundance Guided Meditation
+Morning Guided Meditation | Positive Energy | Nature Visualization
+A Calming Walk Along the Beach Guided  Meditation for Relaxation
+Unlock the Full Potential of Your Mind Guided Meditation
+10 Minute Meditation for Overthinking
+Morning Affirmations for a Beautiful Day Guided Meditation
+Self Love Guided Meditation
+Letting Your Light Shine  (Guided Meditation)
+Feel This Moment 10 Minute Guided Meditation
+Sleep Meditation Positive Affirmations While You Sleep
+10 Minute Guided Meditation to Leave You With Positive Energy
+An Empowering 10 Minute Guided Meditation
+Morning Meditation to Spark Your Passion
+5 Minute Breathing Exercise (Guided Meditation)
+A Beautiful 10 Minute Guided Meditation
+10 Minute Guided Meditation for Attracting Miracles
+Morning Guided Meditation
+10 Minute Spirit Guide Guided Meditation
+All is Well ~ Guided Meditation for Anxiety
+Manifesting Guided Meditation - What do you want to Manifest today?
+Guided Meditation when Stressing over Money
+Relax into this Feeling Guided Meditation
+Rise & Shine Morning Meditation
+Guided Sleep Talk Down Meditation
+You Have Many Things to be Grateful For (Guided Meditation)
+Manifest How do You Want to Feel Today   (Guided Meditation)
+Everything is Working Out for Me (Guided Meditation)
+Enjoy This Very Moment | Guided Meditation
+Sleep Meditation, A Time For Rest and Healing
+5 Minute Morning Meditation For A Joyful Day
+10 Minute Affirmations for Self Acceptance (Guided Meditation)
+Allow Positive Feelings to Grow (10 Minute Guided Meditation)
+Morning Meditation for A Fresh Outlook to A New Day
+Relaxing 10 minute guided meditation for the mind and body
+Feeling Full of Energy A 5 Minute Meditation
+5 Minute Meditation to Rule Your Own Life
+Ask and You Shall Receive, Guided Meditation to Manifest Positive Outcomes
+This Positive Energy Meditation will Leave You Feeling Great
+Sleep Meditation, Drifting Away in Just Ten Minutes
+A 5 Minute Mindful Meditation
+Be Kind To Yourself Guided Meditation for Self Love &  Acceptance
+You Are Capable of Greatness (Guided Meditation)
+Morning Mindfulness Guided Meditation 10 Minutes to Free Your Mind
+Guided Meditation to Access Your Deep Inner Wisdom (Full 10 Minutes)
+This Powerful Meditation Guides You  to Experience Consciousness on a Deeper Level
+Morning Meditation to Take Control of Your Life
+Love ~ Happiness ~ Positivity (Guided Meditation)
+A Pure State of Calmness (Guided Meditation)
+A Guided Meditation When You're Not Feeling Your Best
+A Beautiful 5 Minute Morning Meditation
+Discover A Deep & Meaningful Life Purpose (Guided Meditation)
+Feel Wonderful for the Rest of Your Day (Morning Meditation)
+Inner Child Healing | 10 Minute Guided  Meditation
+Want to Calm Your Mind? Try This 5 Minute Meditation
+Overthinking?  Try This 10 Minute Guided Meditation
+All is Well ~ 10 Minute Guided Meditation
+A New Day ~ A Fresh Start ~ Morning Meditation
+Guided Sleep Meditation 10 Minutes Before You Sleep
+5 Minute Healing Positive Energy Guided Meditation
+Feel Good About Who You Are (Guided Meditation) Self Love... You Deserve it!
+Creating Space for Love Guided Meditation
+Morning Meditation A Positive Start to Your Day ~ POWERFUL!
+Guided Meditation to Awaken your Spirit Body Connection
+5 Minute Meditation to Increase Productivity
+Morning Meditation ~ A Love Letter to Yourself
+Focus on Your Goals (Guided Meditation) to Accelerate your Achievements
+There's No Need To Worry  (Guided Meditation)
+5 Minute Guided Meditation for a Calm Headspace
+A Powerful 15 Minute Guided Meditation
+10 Minute Meditation ~ Feel Your Inner Beauty
+10 Minute Morning Meditation to Clear Your Mind & Receive
+Fall Asleep in 10 Minutes Guided Meditation
+5 Minute Meditation to keep you feeling your Best!
+Deep Inner Stillness Guided Meditation
+20 Minute Guided Meditation
+Powerful Morning Meditation
+Radiating your Inner Light (Guided Meditation)
+5 Minute Morning Meditation A Positive Start to Your Day
+10 Minute Guided Meditation for Students
+Guided Meditation to Live a Rewarding Life
+You Are Perfect As You Are (Guided Meditation)
+A Beautiful 15 Minute Meditation (10 Minute Guided)
+5 Minute Mindful Meditation to be more Calm
+10 Minute Meditation for a Relaxed Mind & Body
+10 Minute Guided Love Energy Meditation
+Morning Meditation with Powerful I AM Affirmations to Start Your Day
+Connect With Your Spirit Guided While You Sleep (Guided Meditation)
+5 Minute Meditation for Positive Energy
+Guided Meditation for Energy Healing
+Love Unconditionally 10 Minute Guided Meditation
+Appreciation for Another Day ~ Morning Meditation
+You Are Supported Spirit Guide Guided Meditation
+A Great 5 Minute Morning Meditation to Start Your Day
+Guided Meditation to Find Your Child Like Happiness
+Feeling Gratitude Guided Meditation
+Living in the Present Mindfulness Meditation
+10 Minute Sleep Meditation for Lucid Dreaming
+5 Minute Morning Meditation to Start Your Day
+Mindful Meditation to Improve Your Focus
+10 Minute Morning Cleansing Guided Meditation
+Guided Meditation for Positive Energy using Crystals (Visualisation)
+Self Love 10 Minute Guided Meditation
+5 Minute Meditation for Complete Inner Stillness
+A Guided Meditation for a Beautiful State of Being
+A Daily Guided Meditation for Wellness & Well Being
+10 Minute Guided Meditation for Your Everyday Mindful Practice
+An Enlightening 10 Minute Guided Meditation
+Clear Your Mind, 5 Minute Meditation, Calm & Relaxed
+A Guided Meditation for Getting Back into Meditation
+10 Minute Meditation to Help You Feel Your Best
+Morning Meditation to Embrace Another Beautiful Day
+Guided Meditation for Better Sleep
+5 Minute Morning Meditation for Feeling Powerful
+Guided Meditation for Finding Peace in Difficult Times
+Guided Meditation for Relaxation
+Morning Meditation as you Awake for the Day
+Chakra Energy Healing Guided Meditation
+5 Minute Meditation to Feel Good Right Now!
+Higher Self Activation Guided Meditation
+10 Minute Meditation for More Joy, Calm & Happiness
+Guided Meditation to Appreciate your own Uniqueness
+Morning Meditation ~ A Fresh Start to a Fresh Day
+Another 5 Minute Morning Meditation to get your Day Started
+Positive Affirmations to Live Your Dream Life (Guided Meditation)
+Guided Meditation for Finding Peace
+A Powerful Guided Meditation full of Positive Energy
+Self Reflection Guided Meditation ~ You've Come So Far!
+Mindful Morning 10 Minute Guided Meditation
+A Time to Meditate on the New Year Ahead of You (Guided Meditation)
+Winter Solstice Guided Meditation
+Five Minute Meditation for a Positive Mind
+Guided Meditation for Positive Subconscious Reprogramming
+Overthinking?  Try this 10 Minute Guided Meditation
+Grateful for Another Day ~ Morning Meditation
+Guided Meditation for a Deep Soul Connection
+Guided Sleep Meditation to End Your Day
+Guided Meditation For Inner Child Healing
+Guided Meditation to Experience the Miracle of Today
+Guided Meditation to Enjoy This Life
+Yoga Nidra Sleep Meditation Guided with Female Voice
+Relax Your Body & Your Mind ~ 5 Minute Guided Meditation
+Guided Meditation for Letting Go
+Guided Meditation for Focusing on the Positive
+Guided Meditation ~ Every Day Keeps Getting Better
+10 Minute Meditation for Going Deep Within Yourself
+5 Minute Gratitude Guided Meditation to Start Your Day
+Guided Meditation for the Present Moment
+Morning Meditation to Find That Inner Stillness
+Morning Meditation for Manifesting Your Desires
+20 Minute Meditation for Peace & Calm
+Full Moon Energy Guided Meditation
+5 Minute Morning Meditation Because You Deserve to Feel Good Today
+10 Minute Meditation for when you're not feeling your best
+Mindfulness Meditation  -  A Guided Ten Minute
+Morning Meditation with Affirmations for a Productive Day
+10-Minute Meditation for Self Love
+5 Minute Morning Meditation to feel the Golden Light Energy
+Guided Meditation for Inner Peace and Calm
+Morning Affirmations for Positive Energy
+Another Beautiful Morning Guided Meditation
+A Healing Sleep Guided Meditation
+A New Moon Guided Meditation
+Visualization Guided Meditation What Do You Want to Accomplish
+Morning Meditation for a Good Day!
+A Positive Guided Meditation ~ You need to try this one!
+Allow Your Desires to Manifest Guided Meditation
+5 Minute Meditation  - Violet Light Flower Energy
+10 Minute Meditation for A Clear Mind
+A Powerful Morning Meditation with a Positive Message
+Morning Meditation for Raising Your Vibration
+10 Minute Meditation for Connecting with Your Spiritual Self
+Five Minute Morning Meditation to Feel the Energy Within You
+Guided Meditation for a Healthy Body, Spirit, Mind
+Positive Energy Meditation to Boost Your Mood
+You are a Miracle 10 Minute Guided Meditation
+Listen to this 5 Minute Meditation Before You Sleep
+5 Minute Meditation A Morning Full of Possibilities
+Mindfulness Guided Meditation for Focus
+You Are Full of Possibilities Guided Meditation
+I am Thankful Guided Meditation for Gratitude
+Guided Meditation for Spiritual Growth
+A Positive Five Minute Guided Meditation
+Exploring Within 10 Minute Meditation
+A Good Morning Meditation [Just 10 Minutes to Start your Day]
+An Everyday Mindful Meditation
+Ten Minute Meditation for Self Love
+A Meditation to Calm your Anxiety
+A Positive Meditation that will leave you feeling Great!
+A Special Meditation to Clear Your Karma
+Morning Energy Higher Self Meditation
+10 Minute Meditation for Making the Best of What You Have
+A Powerful 5 Minute Morning Meditation
+A Time for Balance ~ Autumn Equinox Meditation
+Morning Meditation for More Love, Success, Prosperity & Happiness
+A Daily Guided Meditation
+A Guided Meditation Filled with Divine Love
+Guided Meditation ~ You Are Free
+Morning Meditation for Positive Energy
+Feel Good Visualisation Guided Meditation
+A 10 Minute Guided Meditation to Be at your Best!
+Guided Meditation for Connecting to all that is
+A Guided 5 Minute Morning Meditation
+Receive Clarity & Guidance 10 Minute Meditation
+Becoming Present 10 Minute Guided Meditation
+Affirmations for Positive Thinking 10 Minute Guided Meditation
+5 Minute Meditation ~ You Are Free to Be Yourself
+10 Minute Yes Mantra Meditation Feel the power of Yes!
+A Positive Morning Guided Meditation
+10 Minute Positive Affirmations Morning Meditation
+Open up to your Higher Self 10 Minute Guided Meditation
+5 Minute Chakra Balancing Meditation
+Attract & Manifest Meaningful Relationships Guided Meditation
+A Gift to Yourself (10 Minute Guided Meditation)
+10 Minute Meditation for a Calm Mind
+5 Minute Affirmations for Positive Thinking Guided Meditation
+Full Body 7 Chakra Healing Guided Meditation
+Energy Cleanse 5 minute meditation
+Feeling the Gift of Life Guided Meditation
+Productive morning meditation
+10 Minute Root Chakra Guided Meditation
+5 Minute Morning Meditation to Manifest Your Desires
+Letting Go of Negative Energy Guided Meditation
+Mindful Morning Meditation for Everyday Use
+Align with your Higher Self ~ Lions Gate Meditation
+Boost Creativity, Desire & Confidence ~ Sacral Chakra Guided meditation
+Calm Your Headspace 10 Minute Guided Meditation
+10 Minute Meditation with A Positive Message For You
+Morning Meditation That will Positively affect your day today
+10 Minute Meditation for Loving Kindness
+5 Minute Meditation for Positive Emotions
+I Am Radiant Solar Plexus Chakra Guided Meditation
+Morning Meditation for Inner Strength
+Morning Meditation ~ I Choose to Feel Great
+10 Minute Guided Meditation to Remember Everything Will Be Ok!
+Unconditional Love 10 Minute Meditation Heart Chakra
+5 Minute Meditation to Boost Your Mood
+A Powerful Morning Meditation
+Powerful Morning I AM Affirmations 10 Minute Guided Meditation
+Sleep in 10 Minutes Guided Meditation
+Throat Chakra Meditation for Complete Self Expression
+Guided 5 Minute Morning Gratitude Meditation
+Morning Meditation For Positive Outcomes!
+Morning Meditation For A Productive Day!
+10 Minute Grateful Sleep Meditation
+10 Minute Meditation for Letting Go
+Third Eye Chakra Guided Meditation for Perception, Awareness, and Spiritual Communication
+10 minute guided meditation for mindful living
+10 Minute Guided Meditation ~ Taking The Right Path
+Before You Sleep 10 Minute Guided Meditation
+A Positive 5 Minute Guided Meditation
+A Guided 10 Minute Mindfulness Meditation
+10 Minute Meditation to Access Your Personal Power
+10 Minute Morning Meditation ~ Feel the Power of Intention
+Positive Sleep Guided meditation
+5 Minute Meditation to Clear Your Mind
+10 Minute Crown Chakra Guided Meditation
+Powerful 10 Minute Morning Meditation
+Feel the Summer Energy within you 10 Minute summer solstice meditation
+Sleep in Just 10 Minutes ~ Guided Meditation for Better Sleep
+Take a 5 Minute Meditation Break
+Boost Your Energy 10 Minute Guided Meditation
+10 Minute Guided Meditation for a Positive Morning
+10 Minute Meditation for a Bright Future
+Feeling Grateful Before You Sleep 10 Minute Guided Meditation
+5 Minute Meditation for Morning Anxiety
+5 Minute Meditation for Positive Thinking
+10 Minute Mindfulness Meditation
+Feeling Positive Emotions Morning Meditation (10 Minute Guided)
+10 Minute Sleep Meditation
+5 Minute Morning Meditation for a Great Day
+10 Minute Meditation for a Growth Mindset
+10 Minute Meditation for Self Love
+10 Minute Meditation for Transformation
+Sleep in Ten Minutes (Guided Meditation)
+Positive Energy Before You Sleep Meditation
+10 Minute Meditation Letting Go of Negative Thinking
+10 Minute Positive Energy Meditation
+10 Minute Meditation for Mindfulness
+Sleep Story for Grown Ups (Guided Sleep Meditation)
+10 Minute Meditation for A New Passion for Life
+10 Minute Meditation for Grounding Your Energy
+10 Minute Meditation for A Positive Morning
+10 Minute Meditation for Becoming Attractive Energetically
+5 minute meditation for sleep
+Guided Meditation For Feeling a Deep Connection to Everything
+10 Minute Meditation for Whenever You Need it
+A Morning Affirmation Guided Meditation for Positive Manifesting
+10 Minute Vipassana Meditation ~ See Things As They Really Are
+Sleep Meditation Guided 20 Minute
+10 Minute Morning Meditation for the Highest Most Loving Good
+Feeling Positive (10 Minute Guided Meditation)
+Morning Meditation  (10 Minute Guided Meditation)
+10 Minute Meditation for the Empathetic Soul
+Receiving Loving Positive Energy From Your Spirit Guide (10 minute meditation)
+10 minute meditation you can do anywhere
+10 Minute Meditation to Clear Your Mind
+10 Minute Meditation for Positive Energy
+10 minute spiritual development guided meditation
+10 minute mindfulness meditation
+Shifting from Thinking to Being (10 Minute Guided Meditation)
+10 minute meditation guided by angels
+5 Minute Meditation ~ Breathe & Relax ~ Mindful Meditation
+Floating With The Stars ✨ 10 Minute Guided Meditation
+You Will Feel Great after this 10 minute guided meditation
+Positive Energy 10 Minute Meditation 174hz
+10 Minute Meditation to Clear Your Mind
+10 Minute Meditation for a Positive Life Development
+Receive Messages In Your Sleep Guided Meditation
+10 Minute Manifestation Meditation
+Energy Cleanse Meditation ~ Clear Your System of Any Stress & Anxiety
+Positive Affirmations 10 Minute Morning Meditation
+10 Minute Guided Breathing Meditation
+10 Minute Meditation for Deep Relaxation
+Affirmations for Women | 10 Minute Guided Meditation
+10 Minute Gratitude Meditation
+5 minute meditation for focus
+10 Minute Guided Sleep Meditation (female voice)
+Manifesting Positive Energy  (10 minute guided meditation)
+10 Minute Morning Meditation Feeling Full of Joy & Gratitude
+10 Minute Productive Morning Meditation
+5 Minute Positivity Meditation
+A New Season for Awakening & Growth (Spring Equinox Guided Meditation)
+5 Minute Meditation for Anxiety
+10 Minute Meditation for Expanding Your Consciousness
+10 Minute Meditation to Feel Your Best
+5 Minute Manifestation Meditation (Guided Meditation)
+10 Minute Spiritual Awakening Guided Meditation for Beginners
+Positive Energy Meditation (10 minute guided meditation)
+Feel More Optimistic ( Ten Minute Guided Meditation ) Positive Thinking
+5 Minute Mindfulness Meditation
+5 Minute Meditation Before Sleep
+5 Minute Morning Meditation
+Guided 10 Minute Meditation for Positive Energy
+Powerful Morning Meditation (10 minute guided meditation)
+5 Minute Meditation for Positive Energy
+5 Minute Meditation for Increasing Focus & Clarity (guided visualisation)
+10 Minute Morning Meditation for Anxiety (guided meditation)
+10 Minute Meditation for  Inner Wisdom ( Guided Meditation)
+5 Minute Meditation for Gratitude (guided meditation)
+10 Minute Meditation For Everyone (Guided Meditation)
+5 Minute Meditation Anyone Can Do Anywhere
+10 Minute Morning Meditation
+10 Minute Meditation for Anxiety (Guided Meditation)
+10 Minute Meditation for Before You Sleep
+10 Minute Meditation for Beginners
+Morning Gratitude (10 Minute guided meditation)
+Clear Your Mind From Overthinking (Guided Meditation)
+Cleanse Your Energy (10 Minute Meditation Guided)
+Becoming a New You (10 Minute Guided Meditation)
+Positive 10 Minute Guided Meditation
+10 Minute Meditation for Manifesting (Guided Meditation)
+Feeling Full of Positive Energy (10 Minute Guided Meditation)
+Maintain a Healthy Lifestyle (10 Minute Guided Meditation)
+Every Day Morning Meditation  (10 Minute guided meditation)
+Calm Your Mind Before You Sleep (10 Minute guided meditation) Female Voice
+Your Fresh Start Begins Now (10 Minute Guided Meditation)
+Feel Grateful 10 Minute Guided Meditation
+5 Minute Every Day Guided Meditation
+Guided Meditation for Shifting Realities
+Powerful I AM Affirmations For Positive Change ~ Guided Meditation
+Today I Will Be My Best ~ 10 Minute Guided Meditation
+Chakra Balancing and Cleansing ~  Healing 10 Minute Guided Meditation
+Put Your Mind At Ease ~ 10 minute guided meditation
+Self love ~ Self Forgiveness ~ Self Acceptance ~ 10 minute guided meditation
+Have a Wonderful Day ~ 10 Minute Morning Guided Meditation
+Feeling Like A Brand New You ~ 10 Minute Guided Meditation
+10 Minute Guided Meditation for Gratitude
+Becoming Your Best Self 10 Minute Guided Meditation
+10 Minute Guided Meditation for Becoming More Mindful.
+Feel Amazing 10 Minute Guided Meditation
+Morning Positive Affirmations ~ A 10 minute guided meditation
+10 Minute Morning Guided Meditation for Positive Energy
+Refresh Your Mind ~ Restore your Body ~ 10 minute guided meditation
+Manifest the feelings and let the law of attraction go to work ~ 10 Minute guided meditation
+Feeling Enthusiastic for the Day ~ 10 Minute Morning Guided Meditation
+Completely Immersed in Love ~ 10 Minute Guided Meditation
+Feel Your Best ~ Morning Guided Meditation
+Manifesting Success in Your Life ~ 10 Minute Guided Meditation
+A Ten Minute Guided Meditation to Clear Your Mind
+A Refreshing 10 Minute Guided Meditation
+Living Care Free ~ A Guided 10 Minute Meditation
+Let Your Inner Light Shine 10 Minute Guided Meditation for positive energy
+Mental Clarity & Focus ~ 10 Minute Guided Meditation
+Feeling Grateful and Full of Gratitude 10 Minute Guided Meditation
+Becoming One with Everything ~10 Minute Guided Meditation
+Awakening Consciousness Within You 10 minute guided meditation
+Productive Morning 10 minute guided meditation
+Just Be In The Moment ~ 15 Minute Guided Meditation
+Keeping Positive ~ A 10 Minute Guided Meditation
+Feel The Peace & Serenity Within You ~ 10 Minute Guided Meditation
+You Are Loved and Supported ~ An Uplifting Morning Meditation
+A 10 Minute Guided Mindfulness Meditation Everyone Can Practice
+If Feels so Good to Let Go and Surrender ~ 10 Minute Guided Meditation
+Slowing it Down & Flowing with the Moment ~ A 10 Minute Guided Meditation
+Calm Your Mind - Present Moment 10 Minute Guided Meditation
+Deep Relaxation | A 10 Minute Guided Meditation for Anxiety, Stress and Overthinking
+Becoming the Person You Desire To Be | 10 Minute Guided Meditation
+Positive Energy Guided Meditation for Raising Your Vibrational Frequency
+Relaxing Into The Present Moment | Guided Meditation
+Planting Seeds of Gratitude 10 Minute Guided Meditation
+Guided Meditation for Uncertain Times Through The Eyes of Love
+SUPERCHARGE YOUR MIND Guided Alpha Wave Meditation Boost Your Mood ~ Creativity ~ Learning ~ Memory
+You Are Radiant, Awake & Alive ~ Morning Positive Energy Body Scan ~ Guided Meditation
+Guided Meditation for Overthinking ~ You Are Not Your Thoughts
+A Powerful Connection with Your Higher Self ~ Guided Meditation
+Welcome the Day ~ Morning 10 Minute Guided Meditation
+You Are Limitless ~ 10 Minute Guided Meditation
+Powerful Morning Affirmations for Positive Thinking, Success, & Love ~ Guided Meditaton
+Be Present Guided Meditation 10 minutes of Mindfulness
+Fall into a Deep Sleep ~ 10 Minute Guided Sleep Meditation
+Gratitude The Miracle of Life Guided Meditation
+Clear Your Mind Present Moment Guided Meditation ~ 10 Minutes
+Letting Go of Negative Emotions Guided Meditation
+Powerful Morning Guided Meditation ~ Present Moment ~ Gratitude ~ Success
+Have a Beautiful Day ~ Morning Guided Meditation
+Feel The Powerful Healing Effects of this Positive Energy Guided Meditation
+Effortless Relaxation ~ A  Powerful 10 Minute Guided Meditation
+Remain Calm & Mindful ~ Becoming Aware ~ Guided 10 Minute Meditation
+A Fresh Start ~ A New You ~ the Possibilities are Endless ~ Guided Meditation
+Wake up with Positive Energy ~ 10 Minute Morning Guided Meditation
+Today is Going to Be a Great Day ~ 10 Minute Guided Morning Meditation
+When Your Mind is Resisting Meditation ~ Use This 10 Minute Guided Meditation
+Activate Your Feminine Energy & Awaken the Goddess Within ~ Guided Meditation
+Feel Your Greatness Within ~  Guided 10 Minute Meditation
+Full of Positive Feelings with this Gratitude Guided Meditation
+Trust in Life ~ 10 Minute Guided Meditation
+❤ Attract & Connect with Your Soulmate ❤  Guided Meditation For Manifesting Love
+Today is a Great Day Morning Meditation Guided 10 Minutes
+Clear Mind Present Moment 10 Minute Mindfulness Guided Meditation
+A Positive Morning Meditation Full of Love and Positive Energy
+Female Voice Guided Sleep Meditation 10 Minutes into a Deep Restful Sleep
+Morning Gratitude Guided Meditation ~ optimism, enthusiasm, love, joy, and happiness
+Fully Present 10 minute Mindfulness Guided Meditation
+Release Your Greatness Guided Meditation ~ A 10 Minute Transformation
+Powerful Morning Affirmations & Mindful Meditation
+A Powerful 3-phase Guided Meditation ~ Mindfulness ~ Letting go ~ Gratitude
+Let the Sounds Bring You Into the Present Moment ~ 10 Minute Mindfulness Guided Meditation
+A Safe Place for Anxiety Relief ~ 10 Minute Guided Meditation
+Feeling Full of Energy First Thing in The Morning ~ Guided Meditation
+A Guided Meditation for Getting Through Difficult Situations
+Leaving You Feeling Full of Gratitude ~ 10 Minute Morning Guided Meditation
+Entering into a Perfect State of Being  using Mindfulness ~ 10 Minute Guided Meditation
+Wonderful Morning Meditation 10 Minute Guided Visualization
+Today Will Be Productive ~ Morning Guided Meditation
+Entering Into Higher Consciousness ~ A 10 Minute Guided Meditation
+Guided Mindfulness Morning Meditation ~ Just 10 Minutes to Start Your Day
+Productive Morning Guided Meditation ~ Become Focused and Create the Perfect Day
+Can You Feel The Difference After Using this 10 Minute Mindfulness Guided Meditation
+Connect & Receive Guidance ~ Meet Your Spirit Guide ~ Guided Meditation
+Morning Mindfulness Meditation The Perfect Way to Start Your Day...
+Feel Inspired & Alive with This Morning Motivation Guided Meditation
+Feeling Fully Present in The Moment a 10 Minute Mindfulness Guided Meditation
+Can you feel the powerful Self Healing Energy Within?  Try this 10 minute Guided Meditation.
+Feel in Balance Using this 10 Minute Chakra Guided Meditation
+A Powerful Morning Meditation to Start Your Day
+This Morning Gratitude Meditation will leave you full of Joy & Happiness
+Morning Meditation for Health Wealth & Happiness
+It's a Good Morning Meditation Guided & Energise with Positive Energy Love & Light
+The Perfect Mindfulness Meditation in only 10 Minutes
+Increase your Vibrational Frequency With Positive Energy Guided Meditation
+Become Amazing at Meditation ~ A Guided Meditation for Beginners
+This Powerful 6-phase Morning Meditation has Everything You Could Want in a Guided Meditation
+Positive Energy Chakra Meditation 10 Minute Guided Activation & Alignment
+Morning Meditation for Positive Energy a Guided 10 Minutes
+Feel Amazing For The Day Ahead - Morning Meditation - Guided 10 Minute
