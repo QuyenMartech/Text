@@ -527,12 +527,6 @@ class FacebookAdsLibrary:
                 
         except Exception as e:
             print(f"Error processing keyword files: {e}")
-            
-    def send_telegram_message(self, message):
-        """Send message to Telegram channel."""
-        bot_token = "7584627793:AAHPB4zaMSTYgu2P6N9RMlplr0KcFMP1FQQ"
-        chat_id = "-1002371940283"
-        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         
         try:
             response = requests.post(url, json={
