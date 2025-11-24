@@ -1,4 +1,8 @@
 #!/bin/bash
+# ================================================================
+# Script: 3proxy + Cloudflare WARP (SSH-SAFE v4.1)
+# Version: 4.1 - Fixed installation hang issue
+# ================================================================
 
 if [ "$(id -u)" != "0" ]; then
     echo "❌ Script phải chạy với quyền root"
@@ -12,17 +16,44 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 echo -e "${GREEN}============================================${NC}"
-echo -e "${GREEN}  3proxy + WARP v4.0 (SSH-Safe)${NC}"
+echo -e "${GREEN}  3proxy + WARP v4.1 (SSH-Safe)${NC}"
 echo -e "${GREEN}============================================${NC}"
 
-# ================================================================
-# LƯU Ý QUAN TRỌNG
-# ================================================================
-echo -e "\n${YELLOW}⚠️  LƯU Ý QUAN TRỌNG:${NC}"
-echo -e "${YELLOW}Script này sẽ cấu hình WARP mode 'proxy' thay vì 'warp'${NC}"
-echo -e "${YELLOW}để tránh mất kết nối SSH.${NC}"
-echo -e "\n${BLUE}Nhấn Enter để tiếp tục, hoặc Ctrl+C để hủy...${NC}"
+echo -e "\n${YELLOW}⚠️  LƯU Ý:${NC}"
+echo -e "${YELLOW}WARP sẽ chạy ở chế độ PROXY (an toàn SSH)${NC}"
+echo -e "\n${BLUE}Nhấn Enter để tiếp tục (hoặc Ctrl+C để hủy)${NC}"
 read
+
+# ================================================================
+# PHẦN 0: CÀI ĐẶT GÓI (ĐÃ SỬA)
+# ================================================================
+
+install_packages() {
+    echo -e "\n${YELLOW}[0/8] Cài đặt gói cần thiết...${NC}"
+    
+    if [ -f /etc/redhat-release ]; then
+        echo -e "${BLUE}Đang cài: gcc net-tools bsdtar zip curl expect...${NC}"
+        
+        # Cài từng gói để dễ debug
+        yum install -y gcc 2>&1 | grep -v "^Loaded plugins" | tail -3
+        yum install -y net-tools 2>&1 | grep -v "^Loaded plugins" | tail -3
+        yum install -y bsdtar 2>&1 | grep -v "^Loaded plugins" | tail -3
+        yum install -y zip 2>&1 | grep -v "^Loaded plugins" | tail -3
+        yum install -y curl 2>&1 | grep -v "^Loaded plugins" | tail -3
+        yum install -y expect 2>&1 | grep -v "^Loaded plugins" | tail -3
+        
+    elif [ -f /etc/debian_version ]; then
+        echo -e "${BLUE}Đang cài: gcc net-tools bsdtar zip curl expect...${NC}"
+        
+        apt-get update -qq 2>&1 | tail -3
+        apt-get install -y gcc net-tools bsdtar zip curl expect 2>&1 | grep -v "^Reading" | tail -5
+    else
+        echo -e "${RED}❌ Hệ điều hành không hỗ trợ${NC}"
+        exit 1
+    fi
+    
+    echo -e "${GREEN}✅ Đã cài đặt gói${NC}"
+}
 
 # ================================================================
 # PHẦN 1: CÀI ĐẶT WARP
@@ -33,32 +64,45 @@ install_cloudflare_warp() {
     
     if [ -f /etc/redhat-release ]; then
         echo -e "${BLUE}CentOS/RHEL${NC}"
-        curl -fsSL https://pkg.cloudflareclient.com/cloudflare-warp-ascii.repo | tee /etc/yum.repos.d/cloudflare-warp.repo >/dev/null
-        yum install -y cloudflare-warp >/dev/null 2>&1
+        
+        echo -e "${BLUE}Thêm Cloudflare repo...${NC}"
+        curl -fsSL https://pkg.cloudflareclient.com/cloudflare-warp-ascii.repo | tee /etc/yum.repos.d/cloudflare-warp.repo
+        
+        echo -e "${BLUE}Cài đặt cloudflare-warp...${NC}"
+        yum install -y cloudflare-warp 2>&1 | grep -v "^Loaded plugins" | tail -5
+        
     elif [ -f /etc/debian_version ]; then
         echo -e "${BLUE}Debian/Ubuntu${NC}"
+        
+        echo -e "${BLUE}Thêm GPG key...${NC}"
         curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+        
+        echo -e "${BLUE}Thêm repo...${NC}"
         echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/cloudflare-client.list
+        
+        echo -e "${BLUE}Cài đặt...${NC}"
         apt-get update -qq
-        apt-get install -y cloudflare-warp >/dev/null 2>&1
+        apt-get install -y cloudflare-warp 2>&1 | tail -5
     fi
     
-    echo -e "${GREEN}✅ Đã cài đặt${NC}"
+    echo -e "${GREEN}✅ Đã cài đặt WARP${NC}"
 }
 
 configure_cloudflare_warp() {
-    echo -e "\n${YELLOW}[2/8] Cấu hình WARP (Proxy Mode - An toàn SSH)...${NC}"
+    echo -e "\n${YELLOW}[2/8] Cấu hình WARP (Proxy Mode)...${NC}"
     
-    systemctl enable warp-svc >/dev/null 2>&1
+    echo -e "${BLUE}Khởi động warp-svc...${NC}"
+    systemctl enable warp-svc 2>/dev/null
     systemctl restart warp-svc
     sleep 5
     
-    warp-cli registration delete >/dev/null 2>&1
+    echo -e "${BLUE}Xóa registration cũ...${NC}"
+    warp-cli registration delete 2>/dev/null
     sleep 2
     
     echo -e "${BLUE}Đăng ký WARP...${NC}"
     
-    # Sử dụng expect
+    # Tạo expect script
     cat > /tmp/warp-reg.exp <<'EXPECT'
 #!/usr/bin/expect -f
 set timeout 30
@@ -73,19 +117,30 @@ expect {
 EXPECT
     
     chmod +x /tmp/warp-reg.exp
-    /tmp/warp-reg.exp 2>/dev/null || echo -e "y\ny\ny" | warp-cli registration new 2>/dev/null
+    
+    if command -v expect >/dev/null 2>&1; then
+        /tmp/warp-reg.exp
+    else
+        echo -e "y\ny\ny" | warp-cli registration new
+    fi
+    
     rm -f /tmp/warp-reg.exp
     sleep 3
     
-    # ================================================================
-    # QUAN TRỌNG: Dùng PROXY MODE thay vì WARP MODE
-    # ================================================================
-    echo -e "${BLUE}Đặt chế độ PROXY (an toàn cho SSH)...${NC}"
-    warp-cli mode proxy 2>/dev/null
+    # Kiểm tra registration
+    REG_STATUS=$(warp-cli registration show 2>&1)
+    if echo "$REG_STATUS" | grep -qi "Created\|Device ID"; then
+        echo -e "${GREEN}✅ Đăng ký thành công${NC}"
+    else
+        echo -e "${YELLOW}⚠️  Đăng ký có thể chưa hoàn tất${NC}"
+    fi
+    
+    # Đặt chế độ proxy
+    echo -e "${BLUE}Đặt chế độ PROXY...${NC}"
+    warp-cli mode proxy
     sleep 2
     
-    echo -e "${GREEN}✅ WARP đang chạy ở chế độ PROXY (port 40000)${NC}"
-    echo -e "${YELLOW}⚠️  KHÔNG kết nối WARP global để tránh mất SSH${NC}"
+    echo -e "${GREEN}✅ WARP Proxy sẵn sàng (port 40000)${NC}"
 }
 
 # ================================================================
@@ -107,19 +162,28 @@ gen64() {
 
 install_3proxy() {
     echo -e "\n${YELLOW}[3/8] Cài đặt 3proxy...${NC}"
+    
     URL="https://raw.githubusercontent.com/quayvlog/quayvlog/main/3proxy-3proxy-0.8.6.tar.gz"
-    wget -qO- $URL | bsdtar -xvf- >/dev/null 2>&1
+    
+    echo -e "${BLUE}Download 3proxy...${NC}"
+    wget -qO- $URL | bsdtar -xvf- 2>&1 | head -5
+    
+    if [ ! -d "3proxy-3proxy-0.8.6" ]; then
+        echo -e "${RED}❌ Download thất bại${NC}"
+        exit 1
+    fi
+    
     cd 3proxy-3proxy-0.8.6
-    make -f Makefile.Linux >/dev/null 2>&1
+    
+    echo -e "${BLUE}Compile 3proxy...${NC}"
+    make -f Makefile.Linux 2>&1 | tail -3
+    
     mkdir -p /usr/local/etc/3proxy/{bin,logs,stat}
     cp src/3proxy /usr/local/etc/3proxy/bin/
+    
     cd $WORKDIR
-    echo -e "${GREEN}✅ Đã cài đặt${NC}"
+    echo -e "${GREEN}✅ Đã cài đặt 3proxy${NC}"
 }
-
-# ================================================================
-# PHẦN 3: CẤU HÌNH 3PROXY ĐỂ DÙNG WARP PROXY
-# ================================================================
 
 gen_3proxy() {
     cat <<EOF
@@ -131,19 +195,14 @@ setgid 65535
 setuid 65535
 flush
 
-# ============================================
-# Routing qua Cloudflare WARP SOCKS5 Proxy
-# WARP chạy ở 127.0.0.1:40000
-# ============================================
-
-# Định nghĩa parent proxy (WARP SOCKS5)
+# Route qua WARP SOCKS5 Proxy (127.0.0.1:40000)
 parent 1000 socks5 127.0.0.1 40000
 
 auth strong
 
 users $(awk -F "/" 'BEGIN{ORS="";} {print $1 ":CL:" $2 " "}' ${WORKDATA})
 
-$(awk -F "/" '{print "auth strong\nallow " $1 "\n# Route traffic qua WARP parent proxy\nparent 1000\nproxy -6 -n -a -p" $4 " -i" $3 " -e"$5 "\nflush\n"}' ${WORKDATA})
+$(awk -F "/" '{print "auth strong\nallow " $1 "\nparent 1000\nproxy -6 -n -a -p" $4 " -i" $3 " -e"$5 "\nflush\n"}' ${WORKDATA})
 EOF
 }
 
@@ -155,9 +214,9 @@ EOF
 
 print_proxy() {
     echo -e "\n${GREEN}============================================${NC}"
-    echo -e "${GREEN}  ✅ PROXY ĐÃ SẴN SÀNG!${NC}"
+    echo -e "${GREEN}  ✅ PROXY SẴN SÀNG!${NC}"
     echo -e "${GREEN}============================================${NC}"
-    echo -e "${BLUE}Format: IP:PORT:USERNAME:PASSWORD${NC}"
+    echo -e "${BLUE}Format: IP:PORT:USER:PASS${NC}"
     echo -e "${YELLOW}File: ${WORKDIR}/proxy.txt${NC}\n"
     head -10 proxy.txt
     TOTAL=$(wc -l < proxy.txt)
@@ -184,14 +243,9 @@ $(awk -F "/" '{print "ip -6 addr add " $5 "/64 dev enp1s0"}' ${WORKDATA})
 EOF
 }
 
-# ================================================================
-# PHẦN 4: KHÔNG CẦN ROUTING TABLE PHỨC TẠP
-# ================================================================
-
 create_warp_service() {
-    echo -e "\n${YELLOW}[6/8] Tạo WARP service...${NC}"
+    echo -e "\n${YELLOW}[6/8] Tạo service...${NC}"
     
-    # Service đơn giản, chỉ đảm bảo WARP proxy chạy
     cat >/etc/systemd/system/cloudflare-warp-proxy.service <<EOF
 [Unit]
 Description=Cloudflare WARP Proxy Mode
@@ -201,7 +255,6 @@ Requires=warp-svc.service
 
 [Service]
 Type=oneshot
-# Chỉ đảm bảo WARP ở chế độ proxy, KHÔNG connect
 ExecStart=/usr/bin/warp-cli mode proxy
 RemainAfterExit=yes
 
@@ -210,8 +263,8 @@ WantedBy=multi-user.target
 EOF
 
     systemctl daemon-reload
-    systemctl enable warp-svc >/dev/null 2>&1
-    systemctl enable cloudflare-warp-proxy.service >/dev/null 2>&1
+    systemctl enable warp-svc 2>/dev/null
+    systemctl enable cloudflare-warp-proxy.service 2>/dev/null
     
     echo -e "${GREEN}✅ Service đã tạo${NC}"
 }
@@ -220,14 +273,7 @@ EOF
 # MAIN EXECUTION
 # ================================================================
 
-echo -e "\n${YELLOW}[0/8] Cài đặt gói...${NC}"
-if [ -f /etc/redhat-release ]; then
-    yum -y install gcc net-tools bsdtar zip curl expect >/dev/null 2>&1
-else
-    apt-get update -qq
-    apt-get install -y gcc net-tools bsdtar zip curl expect >/dev/null 2>&1
-fi
-echo -e "${GREEN}✅ Done${NC}"
+install_packages
 
 install_cloudflare_warp
 configure_cloudflare_warp
@@ -242,11 +288,11 @@ mkdir -p $WORKDIR && cd $_
 IP4=$(curl -4 -s icanhazip.com)
 IP6=$(curl -6 -s icanhazip.com | cut -f1-4 -d':')
 
-echo -e "${BLUE}VPS IP:${NC}"
+echo -e "${BLUE}VPS:${NC}"
 echo -e "  IPv4: ${GREEN}${IP4}${NC}"
 echo -e "  IPv6: ${GREEN}${IP6}${NC}"
 
-echo -e "\n${YELLOW}Số lượng proxy:${NC}"
+echo -e "\n${YELLOW}Số lượng proxy (ví dụ: 100):${NC}"
 read COUNT
 
 FIRST_PORT=10000
@@ -282,9 +328,9 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable 3proxy >/dev/null 2>&1
+systemctl enable 3proxy 2>/dev/null
 
-echo -e "${GREEN}✅ Done${NC}"
+echo -e "${GREEN}✅ Cấu hình xong${NC}"
 
 create_warp_service
 
@@ -297,6 +343,7 @@ bash ${WORKDIR}/boot_iptables.sh 2>/dev/null
 bash ${WORKDIR}/boot_ifconfig.sh 2>/dev/null
 
 if command -v firewall-cmd >/dev/null 2>&1; then
+    echo -e "${BLUE}Cấu hình firewall...${NC}"
     for port in $(seq $FIRST_PORT $LAST_PORT); do
         firewall-cmd --permanent --add-port=${port}/tcp 2>/dev/null
     done
@@ -304,6 +351,8 @@ if command -v firewall-cmd >/dev/null 2>&1; then
 fi
 
 gen_proxy_file_for_user
+
+echo -e "${BLUE}Khởi động 3proxy...${NC}"
 systemctl start 3proxy
 sleep 3
 
@@ -314,12 +363,12 @@ print_proxy
 # ================================================================
 
 echo -e "\n${YELLOW}============================================${NC}"
-echo -e "${YELLOW}  KIỂM TRA${NC}"
+echo -e "${YELLOW}  [8/8] KIỂM TRA${NC}"
 echo -e "${YELLOW}============================================${NC}"
 
 # Kiểm tra WARP proxy
-if netstat -tuln | grep -q ":40000"; then
-    echo -e "${GREEN}✅ WARP Proxy: Hoạt động (port 40000)${NC}"
+if netstat -tuln 2>/dev/null | grep -q ":40000" || ss -tuln 2>/dev/null | grep -q ":40000"; then
+    echo -e "${GREEN}✅ WARP Proxy: OK (port 40000)${NC}"
     WARP_OK=true
 else
     echo -e "${RED}❌ WARP Proxy: Chưa chạy${NC}"
@@ -329,23 +378,28 @@ fi
 if systemctl is-active --quiet 3proxy; then
     echo -e "${GREEN}✅ 3proxy: Running${NC}"
 else
-    echo -e "${RED}❌ 3proxy: Error${NC}"
+    echo -e "${RED}❌ 3proxy: Lỗi${NC}"
+    journalctl -u 3proxy -n 10 --no-pager
 fi
 
 # Test proxy
 echo -e "\n${BLUE}Test proxy...${NC}"
 TEST_PROXY=$(head -1 proxy.txt)
-TEST_RESULT=$(timeout 15 curl -x socks5://${TEST_PROXY} -s https://api.ipify.org 2>/dev/null)
 
-if [ -n "$TEST_RESULT" ]; then
-    echo -e "${GREEN}✅ Proxy OK: IP = ${TEST_RESULT}${NC}"
-    if [ "$TEST_RESULT" != "$IP4" ]; then
-        echo -e "${GREEN}✅ Đang qua Cloudflare${NC}"
+if [ -n "$TEST_PROXY" ]; then
+    echo -e "${YELLOW}Đang test: ${TEST_PROXY}${NC}"
+    TEST_RESULT=$(timeout 15 curl -x socks5://${TEST_PROXY} -s https://api.ipify.org 2>/dev/null)
+    
+    if [ -n "$TEST_RESULT" ]; then
+        echo -e "${GREEN}✅ Proxy hoạt động: IP = ${TEST_RESULT}${NC}"
+        if [ "$TEST_RESULT" != "$IP4" ]; then
+            echo -e "${GREEN}✅ Đang qua Cloudflare${NC}"
+        else
+            echo -e "${YELLOW}⚠️  IP giống VPS${NC}"
+        fi
     else
-        echo -e "${YELLOW}⚠️  IP = VPS (WARP có thể chưa hoạt động)${NC}"
+        echo -e "${YELLOW}⚠️  Timeout (thử lại sau)${NC}"
     fi
-else
-    echo -e "${YELLOW}⚠️  Chưa test được${NC}"
 fi
 
 # ================================================================
@@ -358,51 +412,43 @@ echo -e "${GREEN}============================================${NC}"
 
 cat > ${WORKDIR}/HUONG-DAN.txt <<EOF
 ================================================
-  HƯỚNG DẪN
+  HƯỚNG DẪN SỬ DỤNG
 ================================================
 
 FILE: ${WORKDIR}/proxy.txt
-Số lượng: ${COUNT}
+Số lượng: ${COUNT} proxy
 Port: ${FIRST_PORT} - ${LAST_PORT}
 
-CẤU TRÚC HOẠT ĐỘNG:
-  Client → 3proxy (port ${FIRST_PORT}+) 
-         → WARP Proxy (127.0.0.1:40000) 
-         → Cloudflare → Internet
+CẤU TRÚC:
+  Client → 3proxy → WARP Proxy (127.0.0.1:40000) → Cloudflare
 
 TEST:
   curl -x socks5://${TEST_PROXY} https://api.ipify.org
 
-KIỂM TRA WARP PROXY:
-  netstat -tuln | grep 40000
+KIỂM TRA:
+  netstat -tuln | grep 40000   # WARP proxy
+  systemctl status 3proxy
   warp-cli status
 
-KHẮC PHỤC NẾU WARP KHÔNG HOẠT ĐỘNG:
-  1. warp-cli registration delete
-  2. warp-cli registration new  (nhập 'y')
-  3. warp-cli mode proxy
-  4. systemctl restart 3proxy
+KHẮC PHỤC:
+  systemctl restart warp-svc
+  warp-cli mode proxy
+  systemctl restart 3proxy
 
 LOGS:
-  - 3proxy: journalctl -u 3proxy -f
-  - WARP: warp-cli status
+  journalctl -u 3proxy -f
+  journalctl -u warp-svc -f
 
-LƯU Ý:
-  - WARP chạy ở chế độ PROXY, KHÔNG chiếm routing
-  - SSH của bạn AN TOÀN, không bị disconnect
-  - 3proxy chuyển tiếp traffic qua WARP proxy
-
+LƯU Ý: WARP ở chế độ PROXY, SSH an toàn.
 ================================================
 EOF
 
 echo -e "${YELLOW}File: ${WORKDIR}/HUONG-DAN.txt${NC}"
 
-if [ "$WARP_OK" = true ]; then
-    echo -e "\n${GREEN}✅ Tất cả hoạt động tốt!${NC}"
-else
+if [ "$WARP_OK" = false ]; then
     echo -e "\n${YELLOW}⚠️  WARP proxy chưa chạy${NC}"
-    echo -e "${YELLOW}Chạy: warp-cli mode proxy${NC}"
-    echo -e "${YELLOW}Sau đó: systemctl restart 3proxy${NC}"
+    echo -e "${YELLOW}Chạy: systemctl restart warp-svc${NC}"
+    echo -e "${YELLOW}      warp-cli mode proxy${NC}"
 fi
 
-echo -e "\n${GREEN}✅ Script hoàn tất! SSH vẫn an toàn.${NC}"
+echo -e "\n${GREEN}✅ Hoàn tất! SSH an toàn.${NC}"
