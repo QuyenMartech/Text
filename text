@@ -1,609 +1,469 @@
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.action_chains import ActionChains
-from selenium.webdriver.common.keys import Keys
-from functools import wraps
-import functools
-import time
-import pandas as pd
-import os
-import random
-import json
-import requests
-from datetime import datetime, timedelta
-from urllib.parse import quote
+#!/bin/bash
+# ================================================================
 
-class FacebookAdsLibrary:
-    def __init__(self):
-        self.chrome_options = Options()
-        self.chrome_options.add_experimental_option("debuggerAddress", "127.0.0.1:9226")
-        self.chrome_options.add_argument('--disable-gpu')
-        self.chrome_options.add_argument('--no-sandbox')
-        self.chrome_options.add_argument('--disable-dev-shm-usage')
-        self.chrome_options.add_argument('--memory-pressure-off')
-        self.chrome_options.add_argument('--disk-cache-size=1')
-        self.chrome_options.add_argument('--media-cache-size=1')
-        self.chrome_options.add_argument('--disable-applications-cache')
-        self.service = Service()
-        self.driver = None
-        self.tracking_file = os.path.join("Downloads", "Ads Library Analysis", "tracking.json")
-        self.tracking_data = self.load_tracking_data()
-        self.current_keyword = None
-        self.temp_data_buffer = []
-        self.buffer_size = 100
-        self.processed_ids = set()
+# Kiểm tra nếu script chạy với quyền root
+if [ "$(id -u)" != "0" ]; then
+    echo "❌ This script must be run as root" 1>&2
+    echo "Run: sudo bash script.sh"
+    exit 1
+fi
 
-    def load_tracking_data(self):
-        print("Loading tracking data...")
-        if os.path.exists(self.tracking_file):
-            with open(self.tracking_file, 'r', encoding='utf-8') as f:
-                print("Tracking data loaded successfully")
-                return json.load(f)
-        print("No existing tracking data found")
-        return {}
+# Màu sắc cho output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
 
-    def save_tracking_data(self):
-        print("Saving tracking data...")
-        with open(self.tracking_file, 'w', encoding='utf-8') as f:
-            json.dump(self.tracking_data, f, indent=4, ensure_ascii=False)
-        print("Tracking data saved successfully")
+echo -e "${GREEN}============================================${NC}"
+echo -e "${GREEN}  3proxy + Cloudflare WARP Setup${NC}"
+echo -e "${GREEN}============================================${NC}"
 
-    def load_processed_ids(self, output_path):
-        if os.path.exists(output_path):
-            df = pd.read_excel(output_path)
-            return set(df['library_id'].tolist())
-        return set()
+# ================================================================
+# PHẦN 1: CÀI ĐẶT CLOUDFLARE WARP (THÊM MỚI)
+# ================================================================
 
-    def flush_buffer_to_excel(self, output_path):
-        if not self.temp_data_buffer:
-            return
-
-        print(f"Flushing {len(self.temp_data_buffer)} records to Excel...")
-        columns = [
-            'keyword', 'library_id', 'runtime', 'page_name', 'ad_status',
-            'ads_using_content', 'content', 'Button_CTA', 'Link_CTA', 'has_video', 'video_url'
-        ]
-
-        new_df = pd.DataFrame(self.temp_data_buffer)
-        
-        if os.path.exists(output_path):
-            with pd.ExcelWriter(output_path, mode='a', engine='openpyxl', if_sheet_exists='overlay') as writer:
-                start_row = writer.sheets['Sheet1'].max_row
-                new_df.to_excel(writer, index=False, header=False, startrow=start_row)
-        else:
-            new_df = new_df[columns]
-            new_df.to_excel(output_path, index=False)
-
-        self.temp_data_buffer = []
-        print("Buffer flushed successfully")
+install_cloudflare_warp() {
+    echo -e "\n${YELLOW}[BƯỚC 1/8] Cài đặt Cloudflare WARP...${NC}"
     
-    def simulate_human_scroll(self, start_y, end_y, duration=1.0):
-        """Mô phỏng cuộn chuột tự nhiên của người dùng."""
-        print(f"Simulating human scroll from {start_y} to {end_y}")
-        steps = int(duration * 60)  # 60 bước mỗi giây
-        step_y = (end_y - start_y) / steps
+    # Phát hiện hệ điều hành
+    if [ -f /etc/redhat-release ]; then
+        # CentOS/RHEL/Rocky Linux
+        echo -e "${BLUE}Phát hiện: CentOS/RHEL${NC}"
         
-        current_y = start_y
-        for _ in range(steps):
-            # Thêm một chút ngẫu nhiên vào mỗi bước cuộn
-            random_offset = random.uniform(-1, 1)
-            current_y += step_y + random_offset
-            self.driver.execute_script(f"window.scrollTo(0, {current_y});")
-            # Thêm độ trễ ngẫu nhiên giữa các bước
-            time.sleep(random.uniform(0.01, 0.03))
-            
-    def close_block_popup(self):
-        try:
-            # Tìm button OK bằng aria-label và class đặc trưng
-            popup = self.driver.find_element(By.XPATH, "//div[@aria-label='OK' and contains(@class, 'x1i10hfl')]")
-            actions = ActionChains(self.driver)
-            actions.click(popup).perform()
-            time.sleep(1)
-            return True
-        except Exception as e:
-            # Thông báo đơn giản và thân thiện hơn
-            print("Không tìm thấy popup cần đóng - có thể popup chưa xuất hiện hoặc đã được đóng trước đó")
-            return False
-
-    def parse_runtime(self, runtime_text):
-        print(f"Parsing runtime text: {runtime_text}")
-        try:
-            # Xử lý các trường hợp có dấu gạch ngang (-)
-            if " - " in runtime_text:
-                start_date = runtime_text.split(" - ")[0].strip()
-            else:
-                # Loại bỏ các phần text không cần thiết
-                start_date = (runtime_text.replace("Đã bắt đầu chạy ", "")
-                                  .replace("vào ", "")
-                                  .replace("Ngày bắt đầu chạy: ", "")
-                                  .replace("Started running on ", ""))
-
-            # Loại bỏ phần thời gian hoạt động nếu có
-            if "·" in start_date:
-                start_date = start_date.split("·")[0].strip()
-
-            # Thêm xử lý định dạng "dd MMM yyyy"
-            try:
-                if len(start_date.split()) == 3:
-                    day, month, year = start_date.split()
-                    # Chuyển đổi tháng viết tắt sang số
-                    months = {
-                        'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4, 'May': 5, 'Jun': 6,
-                        'Jul': 7, 'Aug': 8, 'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dec': 12
-                    }
-                    month_num = months.get(month, None)
-                    if month_num:
-                        return datetime(int(year), month_num, int(day))
-            except:
-                pass
-
-            try:
-                # Thử parse theo định dạng "MMM dd, yyyy"
-                if "," in start_date:
-                    return datetime.strptime(start_date, "%b %d, %Y")
-            except:
-                pass
-
-            # Xử lý định dạng tiếng Việt: "6 Tháng 12, 2024"
-            if "Tháng" in start_date:
-                date_parts = start_date.split()
-                day = int(date_parts[0])
-                month = int(date_parts[2].replace(',', ''))
-                year = int(date_parts[3])
-                return datetime(year, month, day)
-
-            # Xử lý định dạng tiếng Việt rút gọn: "6 thg 12, 2024"
-            elif "thg" in start_date:
-                return datetime.strptime(start_date, "%d thg %m, %Y")
-
-            print(f"Could not parse date format: {start_date}")
-            return None
-
-        except Exception as e:
-            print(f"Error parsing runtime: {e} for text: {runtime_text}")
-            return None
-
-    def setup_driver(self):
-        print("Setting up Chrome driver...")
-        try:
-            self.driver = webdriver.Chrome(service=self.service, options=self.chrome_options)
-            print("Chrome driver setup successful")
-            return True
-        except Exception as e:
-            print(f"Error setting up driver: {e}")
-            return False
-
-    def extract_ad_data(self, ad_element, keyword):
-                    print("Extracting ad data...")
-                    ad_data = {'keyword': keyword}
-                    
-                    try:
-                        try:
-                            # Trích xuất library_id theo thẻ div và class chính xác
-                            library_id_element = ad_element.find_element(
-                                By.CSS_SELECTOR, "div.xt0e3qv div.x1rg5ohu.x67bb7w span.x8t9es0.xw23nyj.xo1l8bm.x63nzvj.x108nfp6.xq9mrsl.x1h4wwuj.xeuugli"
-                            )
-                            ad_data['library_id'] = library_id_element.text.replace("Library ID: ", "")
-                            print(f"Extracted library ID: {ad_data['library_id']}")
-                        except:
-                            ad_data['library_id'] = "N/A"
-                        
-                        try:
-                            # Trích xuất runtime theo thẻ div chứa thông tin thời gian
-                            runtime_element = ad_element.find_element(
-                                By.CSS_SELECTOR, "div.x3nfvp2.x1e56ztr > span.x8t9es0.xw23nyj.xo1l8bm.x63nzvj.x108nfp6.xq9mrsl.x1h4wwuj.xeuugli:not(.x1emribx):not(.x117nqv4)"
-                            )
-                            ad_data['runtime'] = runtime_element.text
-                            print(f"Extracted runtime: {ad_data['runtime']}")
-                        except:
-                            ad_data['runtime'] = "N/A"
-
-                        try:
-                            ad_data['page_name'] = ad_element.find_element(
-                                By.XPATH, ".//a[contains(@class, 'xt0psk2')]//span"
-                            ).text
-                            print(f"Extracted page name: {ad_data['page_name']}")
-                        except:
-                            ad_data['page_name'] = "N/A"
-                        
-                        try:
-                            ad_data['ad_status'] = ad_element.find_element(
-                                By.CLASS_NAME, "x117nqv4"
-                            ).text
-                            print(f"Extracted ad status: {ad_data['ad_status']}")
-                        except:
-                            ad_data['ad_status'] = "N/A"
-
-                        try:
-                            versions_text = ad_element.find_element(
-                                By.XPATH, ".//span[contains(@class, 'x1fvot60')]//strong"
-                            ).text
-                            ad_data['ads_using_content'] = versions_text
-                            print(f"Extracted ads using content: {ad_data['ads_using_content']}")
-                        except:
-                            ad_data['ads_using_content'] = "N/A"
-                        
-                        try:
-                            ad_data['content'] = ad_element.find_element(
-                                By.CLASS_NAME, "_7jyr"
-                            ).text
-                            print("Extracted ad content")
-                        except:
-                            ad_data['content'] = "N/A"
-                        
-                        try:
-                            # Tìm tất cả các button CTA
-                            cta_elements = ad_element.find_elements(
-                                By.XPATH, ".//div[contains(@class, 'x8t9es0') and contains(@class, 'xuxw1ft') and contains(@class, 'x10wlt62')]"
-                            )
-                            # Lấy text của button cuối cùng
-                            if len(cta_elements) > 0:
-                                ad_data['Button_CTA'] = cta_elements[-1].text
-                            else:
-                                ad_data['Button_CTA'] = "None"
-                            print(f"Extracted CTA button: {ad_data['Button_CTA']}")
-                        except:
-                            ad_data['Button_CTA'] = "None"
-                        
-                        try:
-                            link_cta_elements = ad_element.find_elements(
-                                By.XPATH, ".//div[contains(@class, 'x1iyjqo2') and contains(@class, 'xw3qccf')]//div[@class='_4ik4 _4ik5']"
-                            )
-                            # Lấy text từ các phần tử không rỗng
-                            cta_texts = [elem.text for elem in link_cta_elements if elem.text.strip()]
-                            
-                            # Kết hợp các text tìm được
-                            ad_data['Link_CTA'] = ' | '.join(cta_texts)
-                            print(f"Extracted Link CTA: {ad_data['Link_CTA']}")
-                        except:
-                            ad_data['Link_CTA'] = "None" 
-                            print("No Link CTA found")
-                        
-                        try:
-                            video = ad_element.find_element(By.TAG_NAME, "video")
-                            ad_data['has_video'] = True
-                            ad_data['video_url'] = video.get_attribute('src')
-                            print("Found video content")
-                        except:
-                            ad_data['has_video'] = False
-                            ad_data['video_url'] = "N/A"
-                            
-                            
-                    except Exception as e:
-                        print(f"Error extracting data: {e}")
-                        
-                    return ad_data
-
-    def should_continue_scrolling(self, runtime_text, target_date):
-        print(f"Checking if should continue scrolling for runtime: {runtime_text}")
-        if not runtime_text or runtime_text == "N/A":
-            return True
-            
-        runtime_date = self.parse_runtime(runtime_text)
-        if not runtime_date:
-            return True
-            
-        should_continue = runtime_date >= target_date
-        print(f"Should continue scrolling: {should_continue}")
-        return should_continue
-
-    def scroll_and_extract(self, output_path):
-        print("Starting scroll and extract process...")
+        # Thêm Cloudflare repository
+        curl -fsSL https://pkg.cloudflareclient.com/cloudflare-warp-ascii.repo | tee /etc/yum.repos.d/cloudflare-warp.repo >/dev/null
         
-        self.close_block_popup()  # Kiểm tra và đóng popup
-        scroll_pause_time = random.uniform(3, 5)  # Thời gian dừng ngẫu nhiên
-        last_height = self.driver.execute_script("return document.body.scrollHeight")
-        no_new_content_count = 0
-        max_no_new_content = 8
+        # Cài đặt WARP
+        yum install -y cloudflare-warp >/dev/null 2>&1
         
-        # Load existing IDs at start
-        self.processed_ids = self.load_processed_ids(output_path)
-        print(f"Loaded {len(self.processed_ids)} previously processed ads")
-
-        target_date = None
-        if self.current_keyword in self.tracking_data:
-            first_runtime = datetime.strptime(self.tracking_data[self.current_keyword]['first_runtime'], "%Y-%m-%d")
-            target_date = first_runtime - timedelta(days=60)
-            print(f"Target date set to: {target_date}")
+    elif [ -f /etc/debian_version ]; then
+        # Debian/Ubuntu
+        echo -e "${BLUE}Phát hiện: Debian/Ubuntu${NC}"
         
-        # Theo dõi phần tử cuối cùng đã xử lý
-        last_processed_element = None
+        # Thêm GPG key
+        curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
         
-        while True:
-            try:
-                # Kiểm tra và đóng popup trước khi scroll
-                self.close_block_popup()                
-                
-                print("Waiting for ad elements to load...")
-                time.sleep(random.uniform(3, 5))
-                
-                # Lấy các thông số cuộn trang
-                current_height = self.driver.execute_script("return document.body.scrollHeight")
-                viewport_height = self.driver.execute_script("return window.innerHeight")
-                current_scroll = self.driver.execute_script("return window.pageYOffset")
-                
-                # Tính khoảng cách còn lại có thể cuộn
-                remaining_scroll = current_height - current_scroll - viewport_height
-                
-                # Luôn đảm bảo có một khoảng cuộn tối thiểu
-                scroll_distance = max(
-                    min(viewport_height * random.uniform(0.5, 1.5),
-                        remaining_scroll + viewport_height * 0.2),  # Thêm một chút dư để đảm bảo luôn có thể cuộn
-                    viewport_height * 0.2  # Khoảng cuộn tối thiểu
-                )
-                
-                # Thực hiện cuộn với khoảng cách đã tính
-                scroll_times = random.randint(1, 3)
-                per_scroll_distance = scroll_distance / scroll_times
-                current_position = current_scroll
-                
-                for i in range(scroll_times):
-                
-                    # Kiểm tra và đóng popup trước mỗi lần scroll nhỏ
-                    self.close_block_popup()                
-                    next_position = current_position + per_scroll_distance
-                    next_position += random.uniform(-50, 50)
-                    next_position = min(next_position, current_height - viewport_height * 0.5)
-                    next_position = max(next_position, current_position)
-                    
-                    self.simulate_human_scroll(
-                        current_position,
-                        next_position,
-                        duration=random.uniform(0.8, 1.5)
-                    )
-                    
-                    current_position = next_position
-                    if i < scroll_times - 1:
-                        time.sleep(random.uniform(1, 2))
-                        
-                    # Kiểm tra và đóng popup sau mỗi lần scroll nhỏ
-                    self.close_block_popup()                        
-                
-                # Tìm tất cả các thẻ div chứa quảng cáo
-                ad_elements = WebDriverWait(self.driver, 10).until(
-                    EC.presence_of_all_elements_located((By.CSS_SELECTOR, "div.xh8yej3"))
-                )
-                
-                # Xác định vị trí bắt đầu quét
-                start_index = 0
-                if last_processed_element:
-                    try:
-                        start_index = ad_elements.index(last_processed_element) + 1
-                    except ValueError:
-                        start_index = 0
-                
-                new_ads_processed = 0
-                
-                # Chỉ xử lý các phần tử mới
-                for ad_element in ad_elements[start_index:]:
-                    try:
-                        library_id = None
-                        try:
-                            library_id_element = ad_element.find_element(
-                                By.XPATH, ".//span[contains(text(),'Library ID:')]"
-                            )
-                            library_id = library_id_element.text.replace("Library ID: ", "")
-                        except:
-                            continue
-                        
-                        if library_id and library_id not in self.processed_ids:
-                            print(f"Processing new ad: {library_id}")
-                            ad_data = self.extract_ad_data(ad_element, self.current_keyword)
-                            self.processed_ids.add(library_id)
-                            new_ads_processed += 1
-                            
-                            if not target_date and ad_data['runtime'] != "N/A":
-                                runtime_date = self.parse_runtime(ad_data['runtime'])
-                                if runtime_date:
-                                    self.tracking_data[self.current_keyword] = {
-                                        'first_runtime': runtime_date.strftime("%Y-%m-%d"),
-                                        'target_date': (runtime_date - timedelta(days=60)).strftime("%Y-%m-%d")
-                                    }
-                                    self.save_tracking_data()
-                                    target_date = runtime_date - timedelta(days=60)
-                                    print(f"Updated target date to: {target_date}")
-                            
-                            if target_date and not self.should_continue_scrolling(ad_data['runtime'], target_date):
-                                print(f"Reached target date for keyword '{self.current_keyword}'")
-                                self.flush_buffer_to_excel(output_path)
-                                return
-                            
-                            self.temp_data_buffer.append(ad_data)
-                            if len(self.temp_data_buffer) >= self.buffer_size:
-                                self.flush_buffer_to_excel(output_path)                       
-                            
-                            # Cập nhật phần tử cuối cùng đã xử lý
-                            last_processed_element = ad_element
-                                                       
-                    
-                    except Exception as e:
-                        print(f"Error processing ad element: {e}")
-                        continue
-                
-                if new_ads_processed > 0:
-                    print(f"Successfully processed {new_ads_processed} new ads")
-                    no_new_content_count = 0  # Reset counter chỉ khi có ads mới
-                else:
-                    no_new_content_count += 1
-                    print(f"No new content found. Count: {no_new_content_count}")
-                    
-                if no_new_content_count >= max_no_new_content:
-                    print("Reached maximum attempts without new content")
-                    self.flush_buffer_to_excel(output_path)
-                    return
-                    
-                # Kiểm tra và đóng popup sau khi scroll đến cuối trang
-                self.close_block_popup()
-                
-                print("Scrolling to bottom of page...")
-                self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                print(f"Waiting for {scroll_pause_time} seconds...")
-                time.sleep(scroll_pause_time)
-                print("Adding random delay...")
-                time.sleep(random.uniform(0.5, 1.5))
-                
-                # Kiểm tra và đóng popup sau khi scroll đến cuối trang
-                self.close_block_popup()                
-                
-                new_height = self.driver.execute_script("return document.body.scrollHeight")
-                
-                # Kiểm tra nếu đã đến cuối trang
-                if new_height == last_height:
-                    print("Reached end of page")
-                    self.flush_buffer_to_excel(output_path)
-                    return
-                    
-                last_height = new_height
-                
-            except Exception as e:
-                print(f"Error during scrolling: {e}")
-                print("Waiting 5 seconds before retrying...")
-                time.sleep(5)
-                continue
-
-    def process_keyword(self, keyword, output_path):
-        try:
-            print(f"\nProcessing keyword: {keyword}")
-            self.current_keyword = keyword
-            
-            # Check if keyword is already completed
-            if keyword in self.tracking_data and 'completed' in self.tracking_data[keyword]:
-                print(f"Keyword '{keyword}' already completed. Skipping...")
-                return
-                
-            encoded_keyword = quote(keyword)
-            url = f"https://www.facebook.com/ads/library/?active_status=all&ad_type=all&content_languages[0]=en&country=US&is_targeted_country=false&media_type=video&q={encoded_keyword}&search_type=keyword_unordered"
-            
-            print(f"Navigating to URL: {url}")
-            self.driver.get(url)
-            self.close_block_popup()  # Kiểm tra và đóng popup
-            print("Waiting 5 seconds for page load...")
-            time.sleep(5)
-            
-            self.close_block_popup()  # Kiểm tra và đóng popup
-            
-            self.scroll_and_extract(output_path)
-            
-            # Mark keyword as completed
-            if keyword not in self.tracking_data:
-                self.tracking_data[keyword] = {}
-            self.tracking_data[keyword]['completed'] = True
-            self.save_tracking_data()
-            
-            # Send completion report to Telegram
-            self.send_keyword_completion_report(output_path)
-            
-            print(f"Completed processing keyword '{keyword}'")
-            
-        except Exception as e:
-            print(f"Error processing keyword '{keyword}': {e}")
+        # Thêm repository
+        echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/cloudflare-client.list
         
-    def process_keyword_files(self):
-        print("Starting to process keyword files...")
-        try:
-            ads_library_dir = os.path.join("Downloads", "Ads Library Analysis")
-            txt_files = [f for f in os.listdir(ads_library_dir) if f.endswith('.txt')]
-            
-            print(f"Found {len(txt_files)} text files to process")
-            for txt_file in txt_files:
-                txt_path = os.path.join(ads_library_dir, txt_file)
-                output_path = os.path.join(ads_library_dir, f"{os.path.splitext(txt_file)[0]}_results.xlsx")
-                
-                print(f"\nProcessing file: {txt_file}")
-                with open(txt_path, 'r', encoding='utf-8') as f:
-                    keywords = [line.strip() for line in f if line.strip()]
-                
-                print(f"Found {len(keywords)} keywords in {txt_file}")
-                for keyword in keywords:
-                    print(f"\nProcessing keyword: {keyword}")
-                    self.process_keyword(keyword, output_path)
-                    
-                    print("Waiting 2 seconds before next keyword...")
-                    time.sleep(random.uniform(1, 3)) 
-                
-        except Exception as e:
-            print(f"Error processing keyword files: {e}")
+        apt-get update -qq
+        apt-get install -y cloudflare-warp >/dev/null 2>&1
+    else
+        echo -e "${RED}❌ Hệ điều hành không được hỗ trợ${NC}"
+        exit 1
+    fi
+    
+    echo -e "${GREEN}✅ Đã cài đặt Cloudflare WARP${NC}"
+}
+
+configure_cloudflare_warp() {
+    echo -e "\n${YELLOW}[BƯỚC 2/8] Cấu hình Cloudflare WARP...${NC}"
+    
+    # Đăng ký WARP
+    warp-cli registration delete >/dev/null 2>&1
+    warp-cli register >/dev/null 2>&1
+    
+    # Đặt chế độ WARP (không phải WARP+)
+    warp-cli set-mode warp >/dev/null 2>&1
+    
+    # Kết nối
+    warp-cli connect >/dev/null 2>&1
+    sleep 5
+    
+    # Kiểm tra kết nối
+    if warp-cli status | grep -q "Connected"; then
+        echo -e "${GREEN}✅ Cloudflare WARP đã kết nối${NC}"
         
-        try:
-            response = requests.post(url, json={
-                "chat_id": chat_id,
-                "text": message,
-                "parse_mode": "HTML"
-            })
-            if response.status_code != 200:
-                print(f"Failed to send Telegram message: {response.text}")
-        except Exception as e:
-            print(f"Error sending Telegram message: {e}")
+        # Hiển thị IP sau khi kết nối WARP
+        WARP_IP4=$(curl --interface CloudflareWARP -4 -s icanhazip.com 2>/dev/null || echo "N/A")
+        WARP_IP6=$(curl --interface CloudflareWARP -6 -s icanhazip.com 2>/dev/null || echo "N/A")
+        
+        echo -e "${BLUE}IP qua Cloudflare:${NC}"
+        echo -e "  IPv4: ${GREEN}${WARP_IP4}${NC}"
+        echo -e "  IPv6: ${GREEN}${WARP_IP6}${NC}"
+    else
+        echo -e "${RED}❌ Không thể kết nối WARP${NC}"
+        echo -e "${YELLOW}Đang thử kết nối lại...${NC}"
+        warp-cli disconnect >/dev/null 2>&1
+        sleep 2
+        warp-cli connect >/dev/null 2>&1
+        sleep 5
+        
+        if ! warp-cli status | grep -q "Connected"; then
+            echo -e "${RED}❌ WARP vẫn không kết nối được${NC}"
+            echo -e "${YELLOW}Script sẽ tiếp tục nhưng proxy có thể không hoạt động qua Cloudflare${NC}"
+        fi
+    fi
+}
 
-    def get_excel_row_count(self, output_path):
-        """Get the number of rows in Excel file for current keyword."""
-        try:
-            if os.path.exists(output_path):
-                df = pd.read_excel(output_path)
-                return len(df[df['keyword'] == self.current_keyword])
-            return 0
-        except Exception as e:
-            print(f"Error counting Excel rows: {e}")
-            return 0
+# ================================================================
+# PHẦN 2: CÁC HÀM GỐC CỦA BẠN (GIỮ NGUYÊN)
+# ================================================================
 
-    def send_keyword_completion_report(self, output_path):
-        """Send completion report for current keyword to Telegram."""
-        try:
-            if self.current_keyword in self.tracking_data:
-                data = self.tracking_data[self.current_keyword]
-                first_runtime = datetime.strptime(data['first_runtime'], "%Y-%m-%d")
-                
-                # Get the last runtime from Excel
-                df = pd.read_excel(output_path)
-                keyword_data = df[df['keyword'] == self.current_keyword]
-                if not keyword_data.empty:
-                    last_runtime_str = keyword_data['runtime'].iloc[-1]
-                    last_runtime = self.parse_runtime(last_runtime_str)
-                    last_runtime_str = last_runtime.strftime("%Y-%m-%d") if last_runtime else "Unknown"
-                else:
-                    last_runtime_str = "Unknown"
-                
-                row_count = self.get_excel_row_count(output_path)
-                
-                message = (
-                    f"📊 Keyword Report: <b>{self.current_keyword}</b>\n\n"
-                    f"📅 First data: {data['first_runtime']}\n"
-                    f"🎯 Target date: {data['target_date']}\n"
-                    f"🛑 Last data: {last_runtime_str}\n"
-                    f"📝 Total ads found: {row_count}"
-                )
-                
-                self.send_telegram_message(message)
-                
-        except Exception as e:
-            print(f"Error sending completion report: {e}")
+random() {
+    tr </dev/urandom -dc A-Za-z0-9 | head -c8
+    echo
+}
 
-    def close(self):
-        print("Closing browser...")
-        if self.driver:
-            self.driver.quit()
-        print("Browser closed successfully")
+array=(1 2 3 4 5 6 7 8 9 0 a b c d e f)
+gen64() {
+    ip64() {
+        echo "${array[$RANDOM % 16]}${array[$RANDOM % 16]}${array[$RANDOM % 16]}${array[$RANDOM % 16]}"
+    }
+    echo "$1:$(ip64):$(ip64):$(ip64):$(ip64)"
+}
 
-def main():
-    print("Starting Facebook Ads Library Scraper...")
-    os.makedirs(os.path.join("Downloads", "Ads Library Analysis"), exist_ok=True)
-    print("Created necessary directories")
+install_3proxy() {
+    echo -e "\n${YELLOW}[BƯỚC 3/8] Cài đặt 3proxy...${NC}"
+    URL="https://raw.githubusercontent.com/quayvlog/quayvlog/main/3proxy-3proxy-0.8.6.tar.gz"
+    wget -qO- $URL | bsdtar -xvf-
+    cd 3proxy-3proxy-0.8.6
+    make -f Makefile.Linux
+    mkdir -p /usr/local/etc/3proxy/{bin,logs,stat}
+    cp src/3proxy /usr/local/etc/3proxy/bin/
+    cd $WORKDIR
+    echo -e "${GREEN}✅ Đã cài đặt 3proxy${NC}"
+}
 
-    scraper = FacebookAdsLibrary()
-    print("Initialized scraper")
+# ================================================================
+# PHẦN 3: CẤU HÌNH 3PROXY VỚI WARP (SỬA ĐỔI)
+# ================================================================
 
-    if not scraper.setup_driver():
-        print("Failed to setup driver. Exiting...")
-        return
+gen_3proxy() {
+    cat <<EOF
+daemon
+maxconn 2000
+nscache 65535
+timeouts 1 5 30 60 180 1800 15 60
+setgid 65535
+setuid 65535
+flush
 
-    try:
-        scraper.process_keyword_files()
-    finally:
-        scraper.close()
+# ============================================
+# THÊM MỚI: Cấu hình routing qua Cloudflare WARP
+# ============================================
+# Cloudflare WARP interface
+# parent 1000 socks5 127.0.0.1 40000
 
-if __name__ == "__main__":
-    main()
+auth strong
+
+users $(awk -F "/" 'BEGIN{ORS="";} {print $1 ":CL:" $2 " "}' ${WORKDATA})
+
+$(awk -F "/" '{print "auth strong\nallow " $1 "\n# Route qua CloudflareWARP interface\nproxy -6 -n -a -p" $4 " -i" $3 " -e"$5 "\nflush\n"}' ${WORKDATA})
+EOF
+}
+
+gen_proxy_file_for_user() {
+    cat >proxy.txt <<EOF
+$(awk -F "/" '{print $3 ":" $4 ":" $1 ":" $2 }' ${WORKDATA})
+EOF
+}
+
+print_proxy() {
+    echo -e "\n${GREEN}============================================${NC}"
+    echo -e "${GREEN}  PROXY ĐÃ SẴN SÀNG!${NC}"
+    echo -e "${GREEN}============================================${NC}"
+    echo -e "${BLUE}Format: IP:PORT:USERNAME:PASSWORD${NC}"
+    echo -e "\n${YELLOW}Tất cả proxy đều được bảo vệ bởi Cloudflare WARP${NC}"
+    echo -e "${YELLOW}File proxy đã lưu tại: ${WORKDIR}/proxy.txt${NC}\n"
+    head -10 proxy.txt
+    echo -e "\n${BLUE}... (xem file proxy.txt để biết đầy đủ)${NC}"
+}
+
+gen_data() {
+    seq $FIRST_PORT $LAST_PORT | while read port; do
+        echo "usr$(random)/pass$(random)/$IP4/$port/$(gen64 $IP6)"
+    done
+}
+
+gen_iptables() {
+    cat <<EOF
+$(awk -F "/" '{print "iptables -I INPUT -p tcp --dport " $4 " -m state --state NEW -j ACCEPT"}' ${WORKDATA})
+EOF
+}
+
+gen_ifconfig() {
+    cat <<EOF
+$(awk -F "/" '{print "ip -6 addr add " $5 "/64 dev enp1s0"}' ${WORKDATA})
+EOF
+}
+
+# ================================================================
+# PHẦN 4: CẤU HÌNH ROUTING QUA WARP (THÊM MỚI)
+# ================================================================
+
+configure_warp_routing() {
+    echo -e "\n${YELLOW}[BƯỚC 6/8] Cấu hình routing qua Cloudflare WARP...${NC}"
+    
+    # Tạo routing table cho WARP
+    if ! grep -q "100 warp" /etc/iproute2/rt_tables; then
+        echo "100 warp" >> /etc/iproute2/rt_tables
+    fi
+    
+    # Lấy interface CloudflareWARP
+    WARP_INTERFACE=$(ip -o link show | grep -i cloudflare | awk -F': ' '{print $2}' | head -1)
+    
+    if [ -n "$WARP_INTERFACE" ]; then
+        echo -e "${BLUE}Cloudflare interface: ${WARP_INTERFACE}${NC}"
+        
+        # Thêm route cho IPv6 qua WARP
+        ip -6 route add default dev $WARP_INTERFACE table warp 2>/dev/null
+        
+        # Thêm rule cho IPv6 từ proxy
+        ip -6 rule add from ${IP6}::/64 table warp 2>/dev/null
+        
+        echo -e "${GREEN}✅ Đã cấu hình routing qua WARP${NC}"
+    else
+        echo -e "${YELLOW}⚠️  Không tìm thấy CloudflareWARP interface${NC}"
+        echo -e "${YELLOW}    Proxy sẽ vẫn hoạt động nhưng có thể không qua WARP${NC}"
+    fi
+    
+    # Tạo script tự động khởi động WARP routing
+    cat > /usr/local/bin/setup-warp-routing.sh <<'SCRIPT'
+#!/bin/bash
+# Script tự động cấu hình routing qua WARP
+
+# Đợi WARP kết nối
+for i in {1..30}; do
+    if warp-cli status | grep -q "Connected"; then
+        break
+    fi
+    sleep 1
+done
+
+# Lấy interface
+WARP_INTERFACE=$(ip -o link show | grep -i cloudflare | awk -F': ' '{print $2}' | head -1)
+
+if [ -n "$WARP_INTERFACE" ]; then
+    # Lấy IPv6 subnet
+    IP6=$(curl -6 -s icanhazip.com | cut -f1-4 -d':')
+    
+    # Setup routing
+    ip -6 route add default dev $WARP_INTERFACE table warp 2>/dev/null
+    ip -6 rule add from ${IP6}::/64 table warp 2>/dev/null
+    
+    echo "WARP routing configured successfully"
+else
+    echo "CloudflareWARP interface not found"
+fi
+SCRIPT
+    
+    chmod +x /usr/local/bin/setup-warp-routing.sh
+}
+
+# ================================================================
+# PHẦN 5: TẠO SERVICE TỰ ĐỘNG KHỞI ĐỘNG (THÊM MỚI)
+# ================================================================
+
+create_warp_service() {
+    echo -e "\n${YELLOW}[BƯỚC 7/8] Tạo systemd service cho WARP...${NC}"
+    
+    # Service khởi động WARP trước 3proxy
+    cat >/etc/systemd/system/cloudflare-warp-autoconnect.service <<EOF
+[Unit]
+Description=Cloudflare WARP Auto-connect
+Before=3proxy.service
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/warp-cli connect
+ExecStartPost=/bin/sleep 5
+ExecStartPost=/usr/local/bin/setup-warp-routing.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable cloudflare-warp-autoconnect.service
+    
+    echo -e "${GREEN}✅ Đã tạo WARP auto-connect service${NC}"
+}
+
+# ================================================================
+# PHẦN 6: MAIN EXECUTION
+# ================================================================
+
+echo -e "\n${YELLOW}[BƯỚC 0/8] Cài đặt các gói cần thiết...${NC}"
+yum -y install gcc net-tools bsdtar zip curl >/dev/null 2>&1
+
+# Cài đặt Cloudflare WARP
+install_cloudflare_warp
+configure_cloudflare_warp
+
+# Cài đặt 3proxy
+install_3proxy
+
+echo -e "\n${YELLOW}[BƯỚC 4/8] Thiết lập thư mục làm việc...${NC}"
+WORKDIR="/home/proxy-installer"
+WORKDATA="${WORKDIR}/data.txt"
+mkdir -p $WORKDIR && cd $_
+
+IP4=$(curl -4 -s icanhazip.com)
+IP6=$(curl -6 -s icanhazip.com | cut -f1-4 -d':')
+
+echo -e "${BLUE}IP VPS của bạn:${NC}"
+echo -e "  IPv4: ${GREEN}${IP4}${NC}"
+echo -e "  IPv6 Subnet: ${GREEN}${IP6}${NC}"
+
+echo -e "\n${YELLOW}Bạn muốn tạo bao nhiêu proxy? (Ví dụ: 500)${NC}"
+read COUNT
+
+FIRST_PORT=10000
+LAST_PORT=$(($FIRST_PORT + $COUNT - 1))
+
+echo -e "\n${YELLOW}[BƯỚC 5/8] Tạo dữ liệu proxy...${NC}"
+gen_data >$WORKDIR/data.txt
+gen_iptables >$WORKDIR/boot_iptables.sh
+gen_ifconfig >$WORKDIR/boot_ifconfig.sh
+chmod +x ${WORKDIR}/boot_*.sh
+
+gen_3proxy >/usr/local/etc/3proxy/3proxy.cfg
+
+# Cấu hình hệ thống
+echo "* soft nofile 65535" >> /etc/security/limits.conf
+echo "* hard nofile 65535" >> /etc/security/limits.conf
+
+# Tạo 3proxy service (SỬA ĐỔI: thêm dependency vào WARP)
+cat >/etc/systemd/system/3proxy.service <<EOF
+[Unit]
+Description=3proxy tiny proxy server
+After=network.target cloudflare-warp-autoconnect.service
+Wants=cloudflare-warp-autoconnect.service
+
+[Service]
+Type=forking
+ExecStart=/usr/local/etc/3proxy/bin/3proxy /usr/local/etc/3proxy/3proxy.cfg
+ExecStop=/bin/kill -TERM \$MAINPID
+RemainAfterExit=yes
+Restart=always
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable 3proxy
+
+# Cấu hình routing và services
+configure_warp_routing
+create_warp_service
+
+# Khởi động services
+echo -e "\n${YELLOW}[BƯỚC 8/8] Khởi động các dịch vụ...${NC}"
+
+# Khởi động WARP service
+systemctl start cloudflare-warp-autoconnect.service
+sleep 3
+
+# Chạy network setup
+bash ${WORKDIR}/boot_iptables.sh
+bash ${WORKDIR}/boot_ifconfig.sh
+
+# Cấu hình firewall
+for port in $(seq $FIRST_PORT $LAST_PORT); do
+    firewall-cmd --permanent --add-port=${port}/tcp 2>/dev/null
+done
+firewall-cmd --reload 2>/dev/null
+
+# Tạo file proxy
+gen_proxy_file_for_user
+
+# Khởi động 3proxy
+systemctl start 3proxy
+
+# Hiển thị kết quả
+print_proxy
+
+# ================================================================
+# PHẦN 7: KIỂM TRA VÀ XÁC NHẬN
+# ================================================================
+
+echo -e "\n${YELLOW}============================================${NC}"
+echo -e "${YELLOW}  KIỂM TRA TRẠNG THÁI${NC}"
+echo -e "${YELLOW}============================================${NC}"
+
+# Kiểm tra WARP
+if warp-cli status | grep -q "Connected"; then
+    echo -e "${GREEN}✅ Cloudflare WARP: Đang hoạt động${NC}"
+else
+    echo -e "${RED}❌ Cloudflare WARP: Không kết nối${NC}"
+fi
+
+# Kiểm tra 3proxy
+if systemctl is-active --quiet 3proxy; then
+    echo -e "${GREEN}✅ 3proxy: Đang chạy${NC}"
+else
+    echo -e "${RED}❌ 3proxy: Không hoạt động${NC}"
+    echo -e "${YELLOW}Kiểm tra log: journalctl -u 3proxy${NC}"
+fi
+
+# Kiểm tra ports
+echo -e "\n${BLUE}Kiểm tra một vài port mẫu...${NC}"
+for port in $(seq $FIRST_PORT $(($FIRST_PORT + 2))); do
+    if nc -z localhost $port 2>/dev/null; then
+        echo -e "${GREEN}✅ Port $port: Đang mở${NC}"
+    else
+        echo -e "${RED}❌ Port $port: Không truy cập được${NC}"
+    fi
+done
+
+# Hướng dẫn test
+echo -e "\n${YELLOW}============================================${NC}"
+echo -e "${YELLOW}  HƯỚNG DẪN TEST PROXY${NC}"
+echo -e "${YELLOW}============================================${NC}"
+
+FIRST_PROXY=$(head -1 proxy.txt)
+echo -e "${BLUE}Proxy đầu tiên: ${GREEN}${FIRST_PROXY}${NC}"
+echo -e "\n${YELLOW}Test bằng curl (trên VPS):${NC}"
+echo -e "${BLUE}curl -x socks5://${FIRST_PROXY} https://api.ipify.org${NC}"
+echo -e "\n${YELLOW}Kết quả mong đợi:${NC}"
+echo -e "  - Sẽ hiển thị IP của Cloudflare (KHÔNG phải IP VPS của bạn)"
+echo -e "  - IP này sẽ thay đổi theo thời gian"
+
+echo -e "\n${GREEN}============================================${NC}"
+echo -e "${GREEN}  HOÀN TẤT CÀI ĐẶT!${NC}"
+echo -e "${GREEN}============================================${NC}"
+echo -e "${YELLOW}File proxy: ${WORKDIR}/proxy.txt${NC}"
+echo -e "${YELLOW}Logs: journalctl -u 3proxy -f${NC}"
+echo -e "${YELLOW}WARP status: warp-cli status${NC}"
+
+# Lưu thông tin cấu hình
+cat > ${WORKDIR}/README.txt <<EOF
+================================================
+  3PROXY + CLOUDFLARE WARP CONFIGURATION
+================================================
+
+Số lượng proxy: ${COUNT}
+Port range: ${FIRST_PORT}-${LAST_PORT}
+File proxy: ${WORKDIR}/proxy.txt
+
+VPS IP:
+  IPv4: ${IP4}
+  IPv6: ${IP6}
+
+Cloudflare WARP Status:
+  $(warp-cli status)
+
+Commands:
+  - Xem log 3proxy: journalctl -u 3proxy -f
+  - Xem log WARP: journalctl -u cloudflare-warp-autoconnect -f
+  - Kiểm tra WARP: warp-cli status
+  - Kết nối lại WARP: warp-cli connect
+  - Restart 3proxy: systemctl restart 3proxy
+  - Test proxy: curl -x socks5://USER:PASS@${IP4}:${FIRST_PORT} https://api.ipify.org
+
+Lưu ý:
+  - Tất cả IPv6 proxy đều được route qua Cloudflare WARP
+  - IP hiển thị sẽ là IP của Cloudflare, không phải VPS
+  - IPv6 sẽ tự động rotating qua Cloudflare
+  - Nếu WARP disconnect, chạy: systemctl restart cloudflare-warp-autoconnect
+
+================================================
+EOF
+
+echo -e "\n${BLUE}Thông tin chi tiết đã lưu tại: ${WORKDIR}/README.txt${NC}"
