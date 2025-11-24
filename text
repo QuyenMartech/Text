@@ -1,5 +1,4 @@
 #!/bin/bash
-# ================================================================
 
 # Kiểm tra nếu script chạy với quyền root
 if [ "$(id -u)" != "0" ]; then
@@ -16,11 +15,11 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 echo -e "${GREEN}============================================${NC}"
-echo -e "${GREEN}  3proxy + Cloudflare WARP Setup${NC}"
+echo -e "${GREEN}  3proxy + Cloudflare WARP Setup v2.0${NC}"
 echo -e "${GREEN}============================================${NC}"
 
 # ================================================================
-# PHẦN 1: CÀI ĐẶT CLOUDFLARE WARP (THÊM MỚI)
+# PHẦN 1: CÀI ĐẶT CLOUDFLARE WARP
 # ================================================================
 
 install_cloudflare_warp() {
@@ -60,125 +59,183 @@ install_cloudflare_warp() {
 configure_cloudflare_warp() {
     echo -e "\n${YELLOW}[BƯỚC 2/8] Cấu hình Cloudflare WARP...${NC}"
     
-    # Xóa registration cũ (nếu có)
-    warp-cli registration delete >/dev/null 2>&1
-    sleep 1
-    
-    # Đăng ký WARP với flag --accept-tos (QUAN TRỌNG)
-    echo -e "${BLUE}Đang đăng ký Cloudflare WARP...${NC}"
-    warp-cli --accept-tos registration new >/dev/null 2>&1
-    
-    if [ $? -ne 0 ]; then
-        # Thử cách khác nếu lệnh trên thất bại
-        warp-cli registration new --accept-tos >/dev/null 2>&1
-    fi
-    
+    # Dừng dịch vụ WARP nếu đang chạy
+    systemctl stop warp-svc 2>/dev/null
     sleep 2
     
-    # Đặt chế độ WARP (không phải WARP+)
-    echo -e "${BLUE}Đặt chế độ WARP...${NC}"
-    warp-cli set-mode warp >/dev/null 2>&1
+    # Khởi động dịch vụ WARP
+    echo -e "${BLUE}Khởi động dịch vụ WARP...${NC}"
+    systemctl start warp-svc
+    sleep 3
+    
+    # Xóa registration cũ (nếu có)
+    warp-cli delete 2>/dev/null
     sleep 1
     
-    # Kết nối với flag --accept-tos
-    echo -e "${BLUE}Đang kết nối Cloudflare WARP...${NC}"
-    warp-cli --accept-tos connect >/dev/null 2>&1
+    # ================================================================
+    # PHƯƠNG PHÁP 1: Sử dụng 'yes' để tự động chấp nhận TOS
+    # ================================================================
+    echo -e "${BLUE}Đang đăng ký Cloudflare WARP (tự động chấp nhận TOS)...${NC}"
     
-    if [ $? -ne 0 ]; then
-        # Thử cách khác
-        warp-cli connect --accept-tos >/dev/null 2>&1
+    # Gửi 'yes' tự động vào warp-cli register
+    expect_script=$(cat <<'EXPECT_EOF'
+spawn warp-cli register
+expect {
+    "Do you want to continue*" { send "yes\r"; exp_continue }
+    "Privacy Policy*" { send "yes\r"; exp_continue }
+    "Terms of Service*" { send "yes\r"; exp_continue }
+    eof
+}
+EXPECT_EOF
+)
+    
+    # Kiểm tra xem có 'expect' command không
+    if command -v expect >/dev/null 2>&1; then
+        echo "$expect_script" | expect 2>/dev/null
+    else
+        # Nếu không có expect, dùng phương pháp khác
+        echo -e "${YELLOW}Cài đặt expect...${NC}"
+        if [ -f /etc/redhat-release ]; then
+            yum install -y expect >/dev/null 2>&1
+        else
+            apt-get install -y expect >/dev/null 2>&1
+        fi
+        
+        # Thử lại với expect
+        if command -v expect >/dev/null 2>&1; then
+            echo "$expect_script" | expect 2>/dev/null
+        else
+            # Phương pháp cuối cùng: pipe yes vào
+            yes | warp-cli register 2>/dev/null
+        fi
     fi
     
+    sleep 3
+    
+    # ================================================================
+    # Kiểm tra xem đã đăng ký thành công chưa
+    # ================================================================
+    REGISTRATION_STATUS=$(warp-cli status 2>&1)
+    
+    if echo "$REGISTRATION_STATUS" | grep -qi "registration"; then
+        echo -e "${GREEN}✅ Đã đăng ký WARP${NC}"
+    else
+        echo -e "${YELLOW}⚠️  Thử phương pháp đăng ký thay thế...${NC}"
+        
+        # Tạo file tự động trả lời
+        cat > /tmp/warp-tos-accept.sh <<'AUTOACCEPT'
+#!/bin/bash
+echo "yes" | warp-cli register
+AUTOACCEPT
+        chmod +x /tmp/warp-tos-accept.sh
+        bash /tmp/warp-tos-accept.sh 2>/dev/null
+        sleep 3
+        rm -f /tmp/warp-tos-accept.sh
+    fi
+    
+    # ================================================================
+    # Đặt chế độ WARP
+    # ================================================================
+    echo -e "${BLUE}Đặt chế độ WARP...${NC}"
+    warp-cli set-mode warp 2>/dev/null
+    sleep 2
+    
+    # ================================================================
+    # Kết nối WARP
+    # ================================================================
+    echo -e "${BLUE}Đang kết nối Cloudflare WARP...${NC}"
+    warp-cli connect 2>/dev/null
     sleep 8
     
+    # ================================================================
     # Kiểm tra kết nối
+    # ================================================================
     WARP_STATUS=$(warp-cli status 2>&1)
     
-    if echo "$WARP_STATUS" | grep -q "Connected"; then
+    if echo "$WARP_STATUS" | grep -qi "Connected"; then
         echo -e "${GREEN}✅ Cloudflare WARP đã kết nối thành công${NC}"
         
         # Hiển thị IP sau khi kết nối WARP
         echo -e "${BLUE}Đang kiểm tra IP qua Cloudflare...${NC}"
         
-        # Thử nhiều cách để lấy IP qua WARP
-        WARP_IP4=$(curl --interface CloudflareWARP -4 -s --connect-timeout 5 icanhazip.com 2>/dev/null)
-        if [ -z "$WARP_IP4" ]; then
-            WARP_IP4=$(curl -4 -s --connect-timeout 5 icanhazip.com 2>/dev/null || echo "N/A")
-        fi
+        # Đợi một chút để WARP ổn định
+        sleep 3
         
-        WARP_IP6=$(curl --interface CloudflareWARP -6 -s --connect-timeout 5 icanhazip.com 2>/dev/null)
-        if [ -z "$WARP_IP6" ]; then
-            WARP_IP6=$(curl -6 -s --connect-timeout 5 icanhazip.com 2>/dev/null || echo "N/A")
-        fi
+        # Lấy IP qua WARP
+        WARP_IP4=$(curl -4 -s --connect-timeout 10 icanhazip.com 2>/dev/null || echo "Checking...")
+        WARP_IP6=$(curl -6 -s --connect-timeout 10 icanhazip.com 2>/dev/null || echo "Checking...")
         
-        echo -e "${BLUE}IP qua Cloudflare:${NC}"
+        echo -e "${BLUE}IP qua Cloudflare WARP:${NC}"
         echo -e "  IPv4: ${GREEN}${WARP_IP4}${NC}"
         echo -e "  IPv6: ${GREEN}${WARP_IP6}${NC}"
         
-    elif echo "$WARP_STATUS" | grep -q "Connecting"; then
-        echo -e "${YELLOW}⚠️  WARP đang kết nối... Đợi thêm 10 giây${NC}"
-        sleep 10
+        # Verify IP có phải Cloudflare không
+        if [[ "$WARP_IP4" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            WHOIS_CHECK=$(curl -s "https://ipinfo.io/${WARP_IP4}/org" 2>/dev/null)
+            if echo "$WHOIS_CHECK" | grep -qi "cloudflare"; then
+                echo -e "${GREEN}✅ Xác nhận: IP thuộc Cloudflare${NC}"
+            else
+                echo -e "${YELLOW}⚠️  IP có thể chưa đi qua Cloudflare: ${WHOIS_CHECK}${NC}"
+            fi
+        fi
         
-        if warp-cli status | grep -q "Connected"; then
+    elif echo "$WARP_STATUS" | grep -qi "Connecting"; then
+        echo -e "${YELLOW}⚠️  WARP đang kết nối... Đợi thêm 15 giây${NC}"
+        sleep 15
+        
+        if warp-cli status 2>&1 | grep -qi "Connected"; then
             echo -e "${GREEN}✅ Cloudflare WARP đã kết nối${NC}"
         else
-            echo -e "${RED}❌ WARP mất quá nhiều thời gian để kết nối${NC}"
-            echo -e "${YELLOW}Đang thử phương án khác...${NC}"
-            
-            # Reset và thử lại
-            warp-cli disconnect >/dev/null 2>&1
-            sleep 2
-            warp-cli delete >/dev/null 2>&1
-            sleep 1
-            warp-cli --accept-tos registration new >/dev/null 2>&1
-            sleep 2
-            warp-cli set-mode warp >/dev/null 2>&1
-            warp-cli --accept-tos connect >/dev/null 2>&1
-            sleep 8
-            
-            if warp-cli status | grep -q "Connected"; then
-                echo -e "${GREEN}✅ Cloudflare WARP đã kết nối (lần thử 2)${NC}"
-            else
-                echo -e "${RED}❌ WARP vẫn không kết nối được${NC}"
-                echo -e "${YELLOW}Script sẽ tiếp tục nhưng proxy có thể không hoạt động qua Cloudflare${NC}"
-                echo -e "${YELLOW}Bạn có thể kết nối thủ công sau bằng lệnh:${NC}"
-                echo -e "${BLUE}warp-cli --accept-tos connect${NC}"
-            fi
+            echo -e "${RED}❌ WARP mất quá nhiều thời gian${NC}"
+            handle_warp_failure
         fi
     else
         echo -e "${RED}❌ Không thể kết nối WARP${NC}"
         echo -e "${YELLOW}Trạng thái: ${WARP_STATUS}${NC}"
-        echo -e "${YELLOW}Đang thử kết nối lại...${NC}"
-        
-        # Thử reset hoàn toàn
-        warp-cli disconnect >/dev/null 2>&1
-        sleep 2
-        warp-cli delete >/dev/null 2>&1
-        sleep 2
-        
-        # Đăng ký lại từ đầu
-        warp-cli --accept-tos registration new >/dev/null 2>&1
-        sleep 2
-        warp-cli set-mode warp >/dev/null 2>&1
-        sleep 1
-        warp-cli --accept-tos connect >/dev/null 2>&1
-        sleep 8
-        
-        if warp-cli status | grep -q "Connected"; then
-            echo -e "${GREEN}✅ Cloudflare WARP đã kết nối (sau reset)${NC}"
-        else
-            echo -e "${RED}❌ WARP vẫn không kết nối được sau nhiều lần thử${NC}"
-            echo -e "${YELLOW}Script sẽ tiếp tục nhưng proxy sẽ KHÔNG đi qua Cloudflare${NC}"
-            echo -e "${YELLOW}Để kết nối thủ công, chạy:${NC}"
-            echo -e "${BLUE}warp-cli --accept-tos registration new${NC}"
-            echo -e "${BLUE}warp-cli set-mode warp${NC}"
-            echo -e "${BLUE}warp-cli --accept-tos connect${NC}"
-        fi
+        handle_warp_failure
     fi
 }
 
 # ================================================================
-# PHẦN 2: CÁC HÀM GỐC CỦA BẠN (GIỮ NGUYÊN)
+# Hàm xử lý khi WARP thất bại
+# ================================================================
+handle_warp_failure() {
+    echo -e "${YELLOW}Đang thử khắc phục...${NC}"
+    
+    # Reset hoàn toàn
+    warp-cli disconnect 2>/dev/null
+    sleep 2
+    warp-cli delete 2>/dev/null
+    sleep 2
+    systemctl restart warp-svc
+    sleep 5
+    
+    # Đăng ký lại với timeout
+    timeout 30 bash -c 'yes | warp-cli register' 2>/dev/null
+    sleep 3
+    
+    warp-cli set-mode warp 2>/dev/null
+    sleep 2
+    
+    timeout 20 warp-cli connect 2>/dev/null
+    sleep 8
+    
+    if warp-cli status 2>&1 | grep -qi "Connected"; then
+        echo -e "${GREEN}✅ WARP đã kết nối sau khi reset${NC}"
+    else
+        echo -e "${RED}❌ WARP vẫn không kết nối được${NC}"
+        echo -e "${YELLOW}Script sẽ tiếp tục nhưng proxy sẽ KHÔNG đi qua Cloudflare${NC}"
+        echo -e "\n${YELLOW}Để kết nối thủ công sau khi script chạy xong:${NC}"
+        echo -e "${BLUE}1. warp-cli delete${NC}"
+        echo -e "${BLUE}2. warp-cli register  ${NC}${YELLOW}(nhập 'yes' khi được hỏi)${NC}"
+        echo -e "${BLUE}3. warp-cli set-mode warp${NC}"
+        echo -e "${BLUE}4. warp-cli connect${NC}"
+        echo -e "${BLUE}5. systemctl restart 3proxy${NC}"
+    fi
+}
+
+# ================================================================
+# PHẦN 2: CÁC HÀM GỐC (GIỮ NGUYÊN)
 # ================================================================
 
 random() {
@@ -207,7 +264,7 @@ install_3proxy() {
 }
 
 # ================================================================
-# PHẦN 3: CẤU HÌNH 3PROXY VỚI WARP (SỬA ĐỔI)
+# PHẦN 3: CẤU HÌNH 3PROXY VỚI WARP
 # ================================================================
 
 gen_3proxy() {
@@ -221,16 +278,13 @@ setuid 65535
 flush
 
 # ============================================
-# THÊM MỚI: Cấu hình routing qua Cloudflare WARP
+# Cấu hình routing qua Cloudflare WARP
 # ============================================
-# Cloudflare WARP interface
-# parent 1000 socks5 127.0.0.1 40000
-
 auth strong
 
 users $(awk -F "/" 'BEGIN{ORS="";} {print $1 ":CL:" $2 " "}' ${WORKDATA})
 
-$(awk -F "/" '{print "auth strong\nallow " $1 "\n# Route qua CloudflareWARP interface\nproxy -6 -n -a -p" $4 " -i" $3 " -e"$5 "\nflush\n"}' ${WORKDATA})
+$(awk -F "/" '{print "auth strong\nallow " $1 "\nproxy -6 -n -a -p" $4 " -i" $3 " -e"$5 "\nflush\n"}' ${WORKDATA})
 EOF
 }
 
@@ -245,10 +299,13 @@ print_proxy() {
     echo -e "${GREEN}  PROXY ĐÃ SẴN SÀNG!${NC}"
     echo -e "${GREEN}============================================${NC}"
     echo -e "${BLUE}Format: IP:PORT:USERNAME:PASSWORD${NC}"
-    echo -e "\n${YELLOW}Tất cả proxy đều được bảo vệ bởi Cloudflare WARP${NC}"
-    echo -e "${YELLOW}File proxy đã lưu tại: ${WORKDIR}/proxy.txt${NC}\n"
+    echo -e "\n${YELLOW}Tất cả proxy được bảo vệ bởi Cloudflare WARP${NC}"
+    echo -e "${YELLOW}File proxy: ${WORKDIR}/proxy.txt${NC}\n"
     head -10 proxy.txt
-    echo -e "\n${BLUE}... (xem file proxy.txt để biết đầy đủ)${NC}"
+    TOTAL_LINES=$(wc -l < proxy.txt)
+    if [ $TOTAL_LINES -gt 10 ]; then
+        echo -e "\n${BLUE}... và $((TOTAL_LINES - 10)) proxy khác (xem file proxy.txt)${NC}"
+    fi
 }
 
 gen_data() {
@@ -270,32 +327,49 @@ EOF
 }
 
 # ================================================================
-# PHẦN 4: CẤU HÌNH ROUTING QUA WARP (THÊM MỚI)
+# PHẦN 4: CẤU HÌNH ROUTING QUA WARP
 # ================================================================
 
 configure_warp_routing() {
     echo -e "\n${YELLOW}[BƯỚC 6/8] Cấu hình routing qua Cloudflare WARP...${NC}"
     
     # Tạo routing table cho WARP
-    if ! grep -q "100 warp" /etc/iproute2/rt_tables; then
+    if ! grep -q "100 warp" /etc/iproute2/rt_tables 2>/dev/null; then
         echo "100 warp" >> /etc/iproute2/rt_tables
     fi
     
-    # Lấy interface CloudflareWARP
-    WARP_INTERFACE=$(ip -o link show | grep -i cloudflare | awk -F': ' '{print $2}' | head -1)
+    # Đợi WARP interface xuất hiện
+    echo -e "${BLUE}Đang tìm CloudflareWARP interface...${NC}"
+    
+    for i in {1..10}; do
+        WARP_INTERFACE=$(ip -o link show 2>/dev/null | grep -i cloudflare | awk -F': ' '{print $2}' | head -1)
+        if [ -n "$WARP_INTERFACE" ]; then
+            break
+        fi
+        sleep 2
+    done
     
     if [ -n "$WARP_INTERFACE" ]; then
-        echo -e "${BLUE}Cloudflare interface: ${WARP_INTERFACE}${NC}"
+        echo -e "${GREEN}✅ Tìm thấy interface: ${WARP_INTERFACE}${NC}"
         
         # Thêm route cho IPv6 qua WARP
         ip -6 route add default dev $WARP_INTERFACE table warp 2>/dev/null
         
         # Thêm rule cho IPv6 từ proxy
-        ip -6 rule add from ${IP6}::/64 table warp 2>/dev/null
+        ip -6 rule add from ${IP6}::/64 table warp priority 100 2>/dev/null
+        
+        # Thêm route cho IPv4 (optional)
+        ip -4 route add default dev $WARP_INTERFACE table warp 2>/dev/null
+        ip -4 rule add from ${IP4}/32 table warp priority 100 2>/dev/null
         
         echo -e "${GREEN}✅ Đã cấu hình routing qua WARP${NC}"
+        
+        # Hiển thị routing table
+        echo -e "${BLUE}IPv6 routing table:${NC}"
+        ip -6 route show table warp 2>/dev/null | head -3
     else
         echo -e "${YELLOW}⚠️  Không tìm thấy CloudflareWARP interface${NC}"
+        echo -e "${YELLOW}    Có thể WARP chưa kết nối hoặc đang khởi động${NC}"
         echo -e "${YELLOW}    Proxy sẽ vẫn hoạt động nhưng có thể không qua WARP${NC}"
     fi
     
@@ -306,26 +380,36 @@ configure_warp_routing() {
 
 # Đợi WARP kết nối
 for i in {1..30}; do
-    if warp-cli status | grep -q "Connected"; then
+    if warp-cli status 2>&1 | grep -qi "Connected"; then
         break
     fi
     sleep 1
 done
 
-# Lấy interface
-WARP_INTERFACE=$(ip -o link show | grep -i cloudflare | awk -F': ' '{print $2}' | head -1)
+# Đợi interface xuất hiện
+for i in {1..20}; do
+    WARP_INTERFACE=$(ip -o link show 2>/dev/null | grep -i cloudflare | awk -F': ' '{print $2}' | head -1)
+    if [ -n "$WARP_INTERFACE" ]; then
+        break
+    fi
+    sleep 2
+done
 
 if [ -n "$WARP_INTERFACE" ]; then
     # Lấy IPv6 subnet
-    IP6=$(curl -6 -s icanhazip.com | cut -f1-4 -d':')
+    IP6=$(curl -6 -s --connect-timeout 5 icanhazip.com 2>/dev/null | cut -f1-4 -d':')
+    IP4=$(curl -4 -s --connect-timeout 5 icanhazip.com 2>/dev/null)
     
     # Setup routing
     ip -6 route add default dev $WARP_INTERFACE table warp 2>/dev/null
-    ip -6 rule add from ${IP6}::/64 table warp 2>/dev/null
+    ip -6 rule add from ${IP6}::/64 table warp priority 100 2>/dev/null
     
-    echo "WARP routing configured successfully"
+    ip -4 route add default dev $WARP_INTERFACE table warp 2>/dev/null
+    ip -4 rule add from ${IP4}/32 table warp priority 100 2>/dev/null
+    
+    echo "$(date): WARP routing configured successfully" >> /var/log/warp-routing.log
 else
-    echo "CloudflareWARP interface not found"
+    echo "$(date): CloudflareWARP interface not found" >> /var/log/warp-routing.log
 fi
 SCRIPT
     
@@ -333,7 +417,7 @@ SCRIPT
 }
 
 # ================================================================
-# PHẦN 5: TẠO SERVICE TỰ ĐỘNG KHỞI ĐỘNG (THÊM MỚI)
+# PHẦN 5: TẠO SERVICE TỰ ĐỘNG KHỞI ĐỘNG
 # ================================================================
 
 create_warp_service() {
@@ -344,19 +428,26 @@ create_warp_service() {
 [Unit]
 Description=Cloudflare WARP Auto-connect
 Before=3proxy.service
-After=network.target
+After=network.target warp-svc.service
+Requires=warp-svc.service
 
 [Service]
 Type=oneshot
+ExecStartPre=/bin/sleep 5
 ExecStart=/usr/bin/warp-cli connect
-ExecStartPost=/bin/sleep 5
+ExecStartPost=/bin/sleep 10
 ExecStartPost=/usr/local/bin/setup-warp-routing.sh
 RemainAfterExit=yes
+Restart=on-failure
+RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
+    # Enable warp-svc service
+    systemctl enable warp-svc 2>/dev/null
+    
     systemctl daemon-reload
     systemctl enable cloudflare-warp-autoconnect.service
     
@@ -368,7 +459,12 @@ EOF
 # ================================================================
 
 echo -e "\n${YELLOW}[BƯỚC 0/8] Cài đặt các gói cần thiết...${NC}"
-yum -y install gcc net-tools bsdtar zip curl >/dev/null 2>&1
+if [ -f /etc/redhat-release ]; then
+    yum -y install gcc net-tools bsdtar zip curl expect >/dev/null 2>&1
+else
+    apt-get update -qq
+    apt-get install -y gcc net-tools bsdtar zip curl expect >/dev/null 2>&1
+fi
 
 # Cài đặt Cloudflare WARP
 install_cloudflare_warp
@@ -407,7 +503,7 @@ gen_3proxy >/usr/local/etc/3proxy/3proxy.cfg
 echo "* soft nofile 65535" >> /etc/security/limits.conf
 echo "* hard nofile 65535" >> /etc/security/limits.conf
 
-# Tạo 3proxy service (SỬA ĐỔI: thêm dependency vào WARP)
+# Tạo 3proxy service
 cat >/etc/systemd/system/3proxy.service <<EOF
 [Unit]
 Description=3proxy tiny proxy server
@@ -436,25 +532,30 @@ create_warp_service
 # Khởi động services
 echo -e "\n${YELLOW}[BƯỚC 8/8] Khởi động các dịch vụ...${NC}"
 
-# Khởi động WARP service
-systemctl start cloudflare-warp-autoconnect.service
-sleep 3
+# Khởi động WARP service (nếu chưa chạy)
+if ! warp-cli status 2>&1 | grep -qi "Connected"; then
+    systemctl start cloudflare-warp-autoconnect.service
+    sleep 5
+fi
 
 # Chạy network setup
 bash ${WORKDIR}/boot_iptables.sh
 bash ${WORKDIR}/boot_ifconfig.sh
 
 # Cấu hình firewall
-for port in $(seq $FIRST_PORT $LAST_PORT); do
-    firewall-cmd --permanent --add-port=${port}/tcp 2>/dev/null
-done
-firewall-cmd --reload 2>/dev/null
+if command -v firewall-cmd >/dev/null 2>&1; then
+    for port in $(seq $FIRST_PORT $LAST_PORT); do
+        firewall-cmd --permanent --add-port=${port}/tcp 2>/dev/null
+    done
+    firewall-cmd --reload 2>/dev/null
+fi
 
 # Tạo file proxy
 gen_proxy_file_for_user
 
 # Khởi động 3proxy
 systemctl start 3proxy
+sleep 3
 
 # Hiển thị kết quả
 print_proxy
@@ -468,10 +569,12 @@ echo -e "${YELLOW}  KIỂM TRA TRẠNG THÁI${NC}"
 echo -e "${YELLOW}============================================${NC}"
 
 # Kiểm tra WARP
-if warp-cli status | grep -q "Connected"; then
+if warp-cli status 2>&1 | grep -qi "Connected"; then
     echo -e "${GREEN}✅ Cloudflare WARP: Đang hoạt động${NC}"
+    WARP_WORKING=true
 else
     echo -e "${RED}❌ Cloudflare WARP: Không kết nối${NC}"
+    WARP_WORKING=false
 fi
 
 # Kiểm tra 3proxy
@@ -479,16 +582,21 @@ if systemctl is-active --quiet 3proxy; then
     echo -e "${GREEN}✅ 3proxy: Đang chạy${NC}"
 else
     echo -e "${RED}❌ 3proxy: Không hoạt động${NC}"
-    echo -e "${YELLOW}Kiểm tra log: journalctl -u 3proxy${NC}"
+    echo -e "${YELLOW}Kiểm tra log: journalctl -u 3proxy -n 50${NC}"
 fi
 
 # Kiểm tra ports
-echo -e "\n${BLUE}Kiểm tra một vài port mẫu...${NC}"
-for port in $(seq $FIRST_PORT $(($FIRST_PORT + 2))); do
-    if nc -z localhost $port 2>/dev/null; then
-        echo -e "${GREEN}✅ Port $port: Đang mở${NC}"
+echo -e "\n${BLUE}Kiểm tra port mẫu...${NC}"
+SAMPLE_PORTS=3
+if [ $COUNT -lt 3 ]; then
+    SAMPLE_PORTS=$COUNT
+fi
+
+for port in $(seq $FIRST_PORT $(($FIRST_PORT + $SAMPLE_PORTS - 1))); do
+    if timeout 2 bash -c "echo >/dev/tcp/localhost/$port" 2>/dev/null; then
+        echo -e "${GREEN}✅ Port $port: Accessible${NC}"
     else
-        echo -e "${RED}❌ Port $port: Không truy cập được${NC}"
+        echo -e "${RED}❌ Port $port: Not accessible${NC}"
     fi
 done
 
@@ -499,17 +607,27 @@ echo -e "${YELLOW}============================================${NC}"
 
 FIRST_PROXY=$(head -1 proxy.txt)
 echo -e "${BLUE}Proxy đầu tiên: ${GREEN}${FIRST_PROXY}${NC}"
-echo -e "\n${YELLOW}Test bằng curl (trên VPS):${NC}"
+echo -e "\n${YELLOW}Test trên VPS:${NC}"
 echo -e "${BLUE}curl -x socks5://${FIRST_PROXY} https://api.ipify.org${NC}"
-echo -e "\n${YELLOW}Kết quả mong đợi:${NC}"
-echo -e "  - Sẽ hiển thị IP của Cloudflare (KHÔNG phải IP VPS của bạn)"
-echo -e "  - IP này sẽ thay đổi theo thời gian"
+
+if [ "$WARP_WORKING" = true ]; then
+    echo -e "\n${GREEN}✅ Kết quả mong đợi:${NC}"
+    echo -e "  - Hiển thị IP của Cloudflare"
+    echo -e "  - KHÔNG phải IP VPS (${IP4})"
+else
+    echo -e "\n${YELLOW}⚠️  WARP chưa kết nối:${NC}"
+    echo -e "  - Proxy sẽ hiển thị IP VPS trực tiếp"
+    echo -e "  - Để kích hoạt WARP, chạy thủ công:"
+    echo -e "  ${BLUE}systemctl restart cloudflare-warp-autoconnect${NC}"
+    echo -e "  ${BLUE}systemctl restart 3proxy${NC}"
+fi
 
 echo -e "\n${GREEN}============================================${NC}"
 echo -e "${GREEN}  HOÀN TẤT CÀI ĐẶT!${NC}"
 echo -e "${GREEN}============================================${NC}"
 echo -e "${YELLOW}File proxy: ${WORKDIR}/proxy.txt${NC}"
-echo -e "${YELLOW}Logs: journalctl -u 3proxy -f${NC}"
+echo -e "${YELLOW}Logs 3proxy: journalctl -u 3proxy -f${NC}"
+echo -e "${YELLOW}Logs WARP: journalctl -u cloudflare-warp-autoconnect -f${NC}"
 echo -e "${YELLOW}WARP status: warp-cli status${NC}"
 
 # Lưu thông tin cấu hình
@@ -527,23 +645,64 @@ VPS IP:
   IPv6: ${IP6}
 
 Cloudflare WARP Status:
-  $(warp-cli status)
+  $(warp-cli status 2>&1 | head -1)
 
-Commands:
+Commands hữu ích:
   - Xem log 3proxy: journalctl -u 3proxy -f
   - Xem log WARP: journalctl -u cloudflare-warp-autoconnect -f
   - Kiểm tra WARP: warp-cli status
-  - Kết nối lại WARP: warp-cli connect
+  - Kết nối lại WARP: 
+      warp-cli disconnect
+      warp-cli connect
+      systemctl restart cloudflare-warp-autoconnect
   - Restart 3proxy: systemctl restart 3proxy
-  - Test proxy: curl -x socks5://USER:PASS@${IP4}:${FIRST_PORT} https://api.ipify.org
+  - Test proxy: 
+      curl -x socks5://USER:PASS@${IP4}:${FIRST_PORT} https://api.ipify.org
+  - Xem routing WARP:
+      ip -6 route show table warp
+      ip -6 rule show
+
+Khắc phục sự cố WARP:
+  1. warp-cli disconnect
+  2. warp-cli delete
+  3. systemctl restart warp-svc
+  4. warp-cli register  (nhập 'yes' khi hỏi)
+  5. warp-cli set-mode warp
+  6. warp-cli connect
+  7. systemctl restart cloudflare-warp-autoconnect
+  8. systemctl restart 3proxy
 
 Lưu ý:
-  - Tất cả IPv6 proxy đều được route qua Cloudflare WARP
-  - IP hiển thị sẽ là IP của Cloudflare, không phải VPS
+  - Tất cả IPv6 proxy được route qua Cloudflare WARP
+  - IP hiển thị sẽ là IP Cloudflare, không phải VPS
   - IPv6 sẽ tự động rotating qua Cloudflare
   - Nếu WARP disconnect, chạy: systemctl restart cloudflare-warp-autoconnect
 
 ================================================
 EOF
 
-echo -e "\n${BLUE}Thông tin chi tiết đã lưu tại: ${WORKDIR}/README.txt${NC}"
+echo -e "\n${BLUE}Thông tin chi tiết: ${WORKDIR}/README.txt${NC}"
+
+# Test một proxy mẫu
+echo -e "\n${YELLOW}Đang test proxy mẫu...${NC}"
+TEST_PROXY=$(head -1 proxy.txt)
+TEST_IP=$(echo $TEST_PROXY | cut -d: -f1)
+TEST_PORT=$(echo $TEST_PROXY | cut -d: -f2)
+TEST_USER=$(echo $TEST_PROXY | cut -d: -f3)
+TEST_PASS=$(echo $TEST_PROXY | cut -d: -f4)
+
+TEST_RESULT=$(timeout 10 curl -x socks5://${TEST_USER}:${TEST_PASS}@${TEST_IP}:${TEST_PORT} -s https://api.ipify.org 2>/dev/null)
+
+if [ -n "$TEST_RESULT" ]; then
+    echo -e "${GREEN}✅ Proxy hoạt động! IP hiển thị: ${TEST_RESULT}${NC}"
+    
+    if [ "$TEST_RESULT" != "$IP4" ]; then
+        echo -e "${GREEN}✅ IP khác VPS → Có thể đang đi qua WARP${NC}"
+    else
+        echo -e "${YELLOW}⚠️  IP giống VPS → WARP có thể chưa hoạt động${NC}"
+    fi
+else
+    echo -e "${YELLOW}⚠️  Không test được proxy (timeout hoặc lỗi kết nối)${NC}"
+fi
+
+echo -e "\n${GREEN}✅ Script hoàn tất!${NC}"
