@@ -60,39 +60,119 @@ install_cloudflare_warp() {
 configure_cloudflare_warp() {
     echo -e "\n${YELLOW}[BƯỚC 2/8] Cấu hình Cloudflare WARP...${NC}"
     
-    # Đăng ký WARP
+    # Xóa registration cũ (nếu có)
     warp-cli registration delete >/dev/null 2>&1
-    warp-cli register >/dev/null 2>&1
+    sleep 1
+    
+    # Đăng ký WARP với flag --accept-tos (QUAN TRỌNG)
+    echo -e "${BLUE}Đang đăng ký Cloudflare WARP...${NC}"
+    warp-cli --accept-tos registration new >/dev/null 2>&1
+    
+    if [ $? -ne 0 ]; then
+        # Thử cách khác nếu lệnh trên thất bại
+        warp-cli registration new --accept-tos >/dev/null 2>&1
+    fi
+    
+    sleep 2
     
     # Đặt chế độ WARP (không phải WARP+)
+    echo -e "${BLUE}Đặt chế độ WARP...${NC}"
     warp-cli set-mode warp >/dev/null 2>&1
+    sleep 1
     
-    # Kết nối
-    warp-cli connect >/dev/null 2>&1
-    sleep 5
+    # Kết nối với flag --accept-tos
+    echo -e "${BLUE}Đang kết nối Cloudflare WARP...${NC}"
+    warp-cli --accept-tos connect >/dev/null 2>&1
+    
+    if [ $? -ne 0 ]; then
+        # Thử cách khác
+        warp-cli connect --accept-tos >/dev/null 2>&1
+    fi
+    
+    sleep 8
     
     # Kiểm tra kết nối
-    if warp-cli status | grep -q "Connected"; then
-        echo -e "${GREEN}✅ Cloudflare WARP đã kết nối${NC}"
+    WARP_STATUS=$(warp-cli status 2>&1)
+    
+    if echo "$WARP_STATUS" | grep -q "Connected"; then
+        echo -e "${GREEN}✅ Cloudflare WARP đã kết nối thành công${NC}"
         
         # Hiển thị IP sau khi kết nối WARP
-        WARP_IP4=$(curl --interface CloudflareWARP -4 -s icanhazip.com 2>/dev/null || echo "N/A")
-        WARP_IP6=$(curl --interface CloudflareWARP -6 -s icanhazip.com 2>/dev/null || echo "N/A")
+        echo -e "${BLUE}Đang kiểm tra IP qua Cloudflare...${NC}"
+        
+        # Thử nhiều cách để lấy IP qua WARP
+        WARP_IP4=$(curl --interface CloudflareWARP -4 -s --connect-timeout 5 icanhazip.com 2>/dev/null)
+        if [ -z "$WARP_IP4" ]; then
+            WARP_IP4=$(curl -4 -s --connect-timeout 5 icanhazip.com 2>/dev/null || echo "N/A")
+        fi
+        
+        WARP_IP6=$(curl --interface CloudflareWARP -6 -s --connect-timeout 5 icanhazip.com 2>/dev/null)
+        if [ -z "$WARP_IP6" ]; then
+            WARP_IP6=$(curl -6 -s --connect-timeout 5 icanhazip.com 2>/dev/null || echo "N/A")
+        fi
         
         echo -e "${BLUE}IP qua Cloudflare:${NC}"
         echo -e "  IPv4: ${GREEN}${WARP_IP4}${NC}"
         echo -e "  IPv6: ${GREEN}${WARP_IP6}${NC}"
+        
+    elif echo "$WARP_STATUS" | grep -q "Connecting"; then
+        echo -e "${YELLOW}⚠️  WARP đang kết nối... Đợi thêm 10 giây${NC}"
+        sleep 10
+        
+        if warp-cli status | grep -q "Connected"; then
+            echo -e "${GREEN}✅ Cloudflare WARP đã kết nối${NC}"
+        else
+            echo -e "${RED}❌ WARP mất quá nhiều thời gian để kết nối${NC}"
+            echo -e "${YELLOW}Đang thử phương án khác...${NC}"
+            
+            # Reset và thử lại
+            warp-cli disconnect >/dev/null 2>&1
+            sleep 2
+            warp-cli delete >/dev/null 2>&1
+            sleep 1
+            warp-cli --accept-tos registration new >/dev/null 2>&1
+            sleep 2
+            warp-cli set-mode warp >/dev/null 2>&1
+            warp-cli --accept-tos connect >/dev/null 2>&1
+            sleep 8
+            
+            if warp-cli status | grep -q "Connected"; then
+                echo -e "${GREEN}✅ Cloudflare WARP đã kết nối (lần thử 2)${NC}"
+            else
+                echo -e "${RED}❌ WARP vẫn không kết nối được${NC}"
+                echo -e "${YELLOW}Script sẽ tiếp tục nhưng proxy có thể không hoạt động qua Cloudflare${NC}"
+                echo -e "${YELLOW}Bạn có thể kết nối thủ công sau bằng lệnh:${NC}"
+                echo -e "${BLUE}warp-cli --accept-tos connect${NC}"
+            fi
+        fi
     else
         echo -e "${RED}❌ Không thể kết nối WARP${NC}"
+        echo -e "${YELLOW}Trạng thái: ${WARP_STATUS}${NC}"
         echo -e "${YELLOW}Đang thử kết nối lại...${NC}"
+        
+        # Thử reset hoàn toàn
         warp-cli disconnect >/dev/null 2>&1
         sleep 2
-        warp-cli connect >/dev/null 2>&1
-        sleep 5
+        warp-cli delete >/dev/null 2>&1
+        sleep 2
         
-        if ! warp-cli status | grep -q "Connected"; then
-            echo -e "${RED}❌ WARP vẫn không kết nối được${NC}"
-            echo -e "${YELLOW}Script sẽ tiếp tục nhưng proxy có thể không hoạt động qua Cloudflare${NC}"
+        # Đăng ký lại từ đầu
+        warp-cli --accept-tos registration new >/dev/null 2>&1
+        sleep 2
+        warp-cli set-mode warp >/dev/null 2>&1
+        sleep 1
+        warp-cli --accept-tos connect >/dev/null 2>&1
+        sleep 8
+        
+        if warp-cli status | grep -q "Connected"; then
+            echo -e "${GREEN}✅ Cloudflare WARP đã kết nối (sau reset)${NC}"
+        else
+            echo -e "${RED}❌ WARP vẫn không kết nối được sau nhiều lần thử${NC}"
+            echo -e "${YELLOW}Script sẽ tiếp tục nhưng proxy sẽ KHÔNG đi qua Cloudflare${NC}"
+            echo -e "${YELLOW}Để kết nối thủ công, chạy:${NC}"
+            echo -e "${BLUE}warp-cli --accept-tos registration new${NC}"
+            echo -e "${BLUE}warp-cli set-mode warp${NC}"
+            echo -e "${BLUE}warp-cli --accept-tos connect${NC}"
         fi
     fi
 }
